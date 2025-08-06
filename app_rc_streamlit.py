@@ -250,6 +250,61 @@ with tab_rcs:
 
         if st.session_state.role == 'admin':
             st.header("Administração")
+            with st.expander("Gerenciar Usuários"):
+                all_users = fetch_data("SELECT id, username, role FROM users")
+                st.dataframe(all_users, use_container_width=True, hide_index=True)
+
+                selected_user = st.selectbox("Selecione um usuário para gerenciar",
+                                             options=all_users['username'].tolist())
+
+                if selected_user:
+                    st.subheader(f"Gerenciando: {selected_user}")
+
+                    # Redefinir senha
+                    with st.form(f"reset_pass_{selected_user}"):
+                        st.write("Redefinir Senha")
+                        new_pass = st.text_input("Nova Senha", type="password", key=f"new_pass_{selected_user}")
+                        if st.form_submit_button("Salvar Nova Senha"):
+                            if new_pass:
+                                hashed_pass = hash_password(new_pass)
+                                if execute_query("UPDATE users SET password = ? WHERE username = ?",
+                                                 (hashed_pass, selected_user)):
+                                    st.success(f"Senha de {selected_user} alterada com sucesso.")
+                            else:
+                                st.warning("A nova senha não pode estar em branco.")
+
+                    # Mudar papel
+                    with st.form(f"change_role_{selected_user}"):
+                        st.write("Mudar Papel (Role)")
+                        current_role = all_users[all_users['username'] == selected_user]['role'].iloc[0]
+                        new_role = st.selectbox("Novo Papel", ["user", "admin"],
+                                                index=["user", "admin"].index(current_role))
+                        if st.form_submit_button("Mudar Papel"):
+                            num_admins = \
+                            fetch_data("SELECT COUNT(id) as count FROM users WHERE role = 'admin'").iloc[0]['count']
+                            if current_role == 'admin' and num_admins <= 1 and new_role == 'user':
+                                st.error("Não é possível remover o último administrador.")
+                            else:
+                                if execute_query("UPDATE users SET role = ? WHERE username = ?",
+                                                 (new_role, selected_user)):
+                                    st.success(f"O papel de {selected_user} foi alterado para {new_role}.")
+                                    # Se o admin mudou o próprio papel, deslogar para segurança
+                                    if selected_user == st.session_state.username:
+                                        st.warning("Seu papel foi alterado. Você será deslogado.")
+                                        time.sleep(2)
+                                        for key in list(st.session_state.keys()):
+                                            del st.session_state[key]
+                                        st.rerun()
+
+                    # Excluir usuário
+                    if selected_user != st.session_state.username:
+                        if st.button(f"Excluir {selected_user}", use_container_width=True, type="secondary"):
+                            if execute_query("DELETE FROM users WHERE username = ?", (selected_user,)):
+                                st.success(f"Usuário {selected_user} excluído com sucesso.")
+                                st.rerun()
+                    else:
+                        st.info("Você não pode excluir sua própria conta.")
+
             with st.expander("⚠️ Opções Perigosas"):
                 if st.button("Zerar Dados de RCs e Pedidos", use_container_width=True):
                     st.session_state.confirm_reset = True
