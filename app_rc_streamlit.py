@@ -107,8 +107,7 @@ def execute_query(query, params=()):
 
 
 def reset_database():
-    """Apaga o arquivo do banco de dados para zerar a aplicação."""
-    # Mantém os usuários, apaga apenas os dados de RCs e Pedidos
+    """Apaga os dados das tabelas de RCs e Pedidos, mantendo os usuários."""
     execute_query("DELETE FROM pedidos")
     execute_query("DELETE FROM requisicoes")
     st.cache_data.clear()
