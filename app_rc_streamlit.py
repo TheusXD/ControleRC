@@ -645,10 +645,6 @@ else:
                                 st.info(f"Pedido já existe.")
 
     with tab_pedidos:
-        if st.session_state.role == 'gestor':
-            st.info("Esta seção é para o time de Compras e Administradores.")
-            st.stop()
-
         st.header("Pedidos de Compra Gerados")
         query_pedidos = "SELECT p.id, p.rc_id, r.numero_rc, p.data_pedido, p.numero_pedido, p.previsao_entrega, p.status_pedido, r.solicitante, p.observacoes_pedido FROM requisicoes r JOIN pedidos p ON r.id = p.rc_id ORDER BY p.id DESC"
         df_pedidos = fetch_data(query_pedidos)
@@ -656,32 +652,33 @@ else:
             st.info("Nenhum pedido de compra encontrado.")
         else:
             st.dataframe(df_pedidos, use_container_width=True, hide_index=True)
-            st.subheader("Operações com o Pedido Selecionado")
-            pedido_ids = df_pedidos['id'].tolist()
-            selected_id_pedido = st.selectbox("Selecione um Pedido", options=pedido_ids,
-                                              format_func=lambda x: f"Pedido Nº {x}", key="select_pedido")
-            if selected_id_pedido:
-                col_edit, col_delete, col_space = st.columns([1.5, 1.5, 7])
-                with col_edit:
-                    if st.button("✏️ Editar Pedido", use_container_width=True):
-                        st.session_state.pedido_edit_id = selected_id_pedido
-                        st.session_state.show_pedido_form = True
-                        st.rerun()
-                with col_delete:
-                    if st.button("🗑️ Excluir Pedido", use_container_width=True, type="secondary"):
-                        st.session_state.confirm_pedido_delete = selected_id_pedido
-                        st.rerun()
-                if st.session_state.confirm_pedido_delete == selected_id_pedido:
-                    st.warning(f"Tem certeza que deseja excluir o Pedido Nº {selected_id_pedido}?")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Sim, excluir pedido", use_container_width=True, type="primary"):
-                            if execute_query("DELETE FROM pedidos WHERE id = ?", (selected_id_pedido,)):
-                                st.success(f"Pedido Nº {selected_id_pedido} excluído!")
-                                st.session_state.confirm_pedido_delete = None
-                                time.sleep(1)
-                                st.rerun()
-                    with c2:
-                        if st.button("Cancelar exclusão", use_container_width=True):
-                            st.session_state.confirm_pedido_delete = None
+            if st.session_state.role != 'gestor':
+                st.subheader("Operações com o Pedido Selecionado")
+                pedido_ids = df_pedidos['id'].tolist()
+                selected_id_pedido = st.selectbox("Selecione um Pedido", options=pedido_ids,
+                                                  format_func=lambda x: f"Pedido Nº {x}", key="select_pedido")
+                if selected_id_pedido:
+                    col_edit, col_delete, col_space = st.columns([1.5, 1.5, 7])
+                    with col_edit:
+                        if st.button("✏️ Editar Pedido", use_container_width=True):
+                            st.session_state.pedido_edit_id = selected_id_pedido
+                            st.session_state.show_pedido_form = True
                             st.rerun()
+                    with col_delete:
+                        if st.button("🗑️ Excluir Pedido", use_container_width=True, type="secondary"):
+                            st.session_state.confirm_pedido_delete = selected_id_pedido
+                            st.rerun()
+                    if st.session_state.confirm_pedido_delete == selected_id_pedido:
+                        st.warning(f"Tem certeza que deseja excluir o Pedido Nº {selected_id_pedido}?")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("Sim, excluir pedido", use_container_width=True, type="primary"):
+                                if execute_query("DELETE FROM pedidos WHERE id = ?", (selected_id_pedido,)):
+                                    st.success(f"Pedido Nº {selected_id_pedido} excluído!")
+                                    st.session_state.confirm_pedido_delete = None
+                                    time.sleep(1)
+                                    st.rerun()
+                        with c2:
+                            if st.button("Cancelar exclusão", use_container_width=True):
+                                st.session_state.confirm_pedido_delete = None
+                                st.rerun()
