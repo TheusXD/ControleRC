@@ -531,7 +531,8 @@ else:
         with st.expander("➕ Adicionar Nova Demanda"):
             with st.form("demanda_form", clear_on_submit=True):
                 descricao_necessidade = st.text_area("O que precisa comprar ou contratar? (Material ou Serviço)")
-                uploaded_file = st.file_uploader("Anexar imagem (opcional)", type=["png", "jpg", "jpeg"])
+                uploaded_file = st.file_uploader("Anexar arquivo (imagem, PDF, Doc)",
+                                                 type=["png", "jpg", "jpeg", "pdf", "doc", "docx"])
 
                 submitted = st.form_submit_button("Registrar Demanda")
                 if submitted:
@@ -570,11 +571,28 @@ else:
                     st.info(f"**Necessidade:** {row['descricao_necessidade']}")
                 with col2:
                     if row['anexo_path'] and os.path.exists(row['anexo_path']):
-                        try:
-                            image = Image.open(row['anexo_path'])
-                            st.image(image, caption="Anexo", use_container_width=True)
-                        except Exception as e:
-                            st.warning("Não foi possível carregar o anexo.")
+                        file_path = row['anexo_path']
+                        file_name = os.path.basename(file_path)
+                        file_extension = os.path.splitext(file_name)[1].lower()
+
+                        if file_extension in ['.png', '.jpg', '.jpeg']:
+                            try:
+                                image = Image.open(file_path)
+                                st.image(image, caption="Anexo", use_container_width=True)
+                            except Exception as e:
+                                st.warning("Não foi possível carregar a imagem.")
+                        else:
+                            try:
+                                with open(file_path, "rb") as file:
+                                    st.download_button(
+                                        label=f"Baixar Anexo ({file_name})",
+                                        data=file,
+                                        file_name=file_name,
+                                        mime="application/octet-stream",
+                                        key=f"download_{row['id']}"
+                                    )
+                            except Exception as e:
+                                st.warning("Não foi possível carregar o anexo para download.")
 
                 action_col1, action_col2 = st.columns([1, 4])
                 with action_col1:
