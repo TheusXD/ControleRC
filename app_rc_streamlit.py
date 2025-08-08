@@ -6,9 +6,20 @@ import os
 import time
 import hashlib
 from PIL import Image
+import logging
+import shutil
+import io
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+from openpyxl.utils import get_column_letter
 
 # --- CONFIGURAÇÕES DA PÁGINA E ESTADO DA SESSÃO ---
 st.set_page_config(page_title="Controle de Compras", layout="wide")
+
+# --- CONFIGURAÇÃO DE LOGGING ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    filename='app_log.log',
+                    filemode='a')
 
 # --- FUNÇÕES DE BANCO DE DADOS E AUTENTICAÇÃO ---
 DB_NAME = "controle_rcs.db"
@@ -77,37 +88,48 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            role TEXT NOT NULL
+            password BLOB NOT NULL,
+            salt BLOB NOT NULL,
+            role TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
         )
     """)
 
-    # --- VERIFICAÇÃO E ADIÇÃO DE COLUNAS FALTANTES ---
-    # Verifica a coluna status na tabela users
+    # --- VERIFICAÇÃO E ADIÇÃO DE COLUNAS FALTANTES (MIGRAÇÃO SEGURA) ---
     cursor.execute("PRAGMA table_info(users)")
-    columns = [info[1] for info in cursor.fetchall()]
-    if 'status' not in columns:
-        # Adiciona a coluna e define todos os usuários existentes como 'active'
+    user_columns = [info[1] for info in cursor.fetchall()]
+    if 'status' not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    if 'salt' not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN salt BLOB")
 
-    # Verifica a coluna demanda_id na tabela requisicoes
     cursor.execute("PRAGMA table_info(requisicoes)")
     columns_req = [info[1] for info in cursor.fetchall()]
     if 'demanda_id' not in columns_req:
         cursor.execute("ALTER TABLE requisicoes ADD COLUMN demanda_id INTEGER")
 
+    cursor.execute("PRAGMA table_info(demandas)")
+    columns_dem = [info[1] for info in cursor.fetchall()]
+    if 'status_demanda' not in columns_dem:
+        cursor.execute("ALTER TABLE demandas ADD COLUMN status_demanda TEXT NOT NULL DEFAULT 'Aberta'")
+
     conn.commit()
     conn.close()
 
 
-def hash_password(password):
-    """Retorna o hash de uma senha."""
-    return hashlib.sha256(str.encode(password)).hexdigest()
+def hash_password(password, salt=None):
+    """Gera um hash seguro para a senha usando PBKDF2 com salt."""
+    if salt is None:
+        salt = os.urandom(16)
+    hashed_password = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return hashed_password, salt
 
 
-def check_password(hashed_password, user_password):
-    """Verifica se a senha fornecida corresponde ao hash."""
-    return hashed_password == hash_password(user_password)
+def check_password(stored_password, salt, provided_password):
+    """Verifica se a senha fornecida corresponde ao hash armazenado."""
+    if salt is None:
+        return False
+    return stored_password == hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
 
 
 def fetch_data(query, params=()):
@@ -128,7 +150,7 @@ def execute_query(query, params=()):
         return True
     except sqlite3.IntegrityError as e:
         if "UNIQUE constraint failed: requisicoes.numero_rc" in str(e):
-            st.error("Erro: O Nº da RC informado já existe. Por favor, utilize outro número.")
+            st.error("Erro: O Nº da RC informado já existe.")
         elif "UNIQUE constraint failed: users.username" in str(e):
             st.error("Erro: Nome de usuário já existe.")
         else:
@@ -139,12 +161,24 @@ def execute_query(query, params=()):
         return False
 
 
+def backup_database():
+    """Cria um backup do arquivo de banco de dados com timestamp."""
+    if os.path.exists(DB_NAME):
+        backup_filename = f"{DB_NAME}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy2(DB_NAME, backup_filename)
+        return backup_filename
+    return None
+
+
 def reset_database():
     """Apaga os dados das tabelas, mantendo os usuários."""
+    backup_file = backup_database()
+    if backup_file:
+        st.toast(f"Backup criado em: {backup_file}", icon="📦")
+
     execute_query("DELETE FROM pedidos")
     execute_query("DELETE FROM requisicoes")
     execute_query("DELETE FROM demandas")
-    # Limpa a pasta de uploads
     for filename in os.listdir(UPLOAD_DIR):
         file_path = os.path.join(UPLOAD_DIR, filename)
         try:
@@ -153,6 +187,7 @@ def reset_database():
         except Exception as e:
             st.error(f"Erro ao deletar arquivo {file_path}: {e}")
     st.cache_data.clear()
+    logging.warning(f"O usuário '{st.session_state.username}' zerou o banco de dados.")
 
 
 # --- FUNÇÕES AUXILIARES ---
@@ -163,15 +198,64 @@ def format_currency(value):
     return value
 
 
-@st.cache_data
-def check_column_exists(table_name, column_name):
-    """Verifica se uma coluna existe em uma tabela."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    columns = [info[1] for info in cursor.fetchall()]
-    conn.close()
-    return column_name in columns
+def safe_strptime(date_string, fmt):
+    try:
+        return datetime.strptime(date_string, fmt)
+    except (ValueError, TypeError):
+        return None
+
+
+def to_excel(df, title="Relatório"):
+    """Converte um DataFrame para um arquivo Excel formatado em memória."""
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name=title)
+
+        workbook = writer.book
+        worksheet = writer.sheets[title]
+
+        # Estilos
+        header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        border = Border(left=Side(style='thin'),
+                        right=Side(style='thin'),
+                        top=Side(style='thin'),
+                        bottom=Side(style='thin'))
+        alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        # Formatar cabeçalho
+        for col in range(1, len(df.columns) + 1):
+            cell = worksheet.cell(row=1, column=col)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = border
+            cell.alignment = alignment
+
+            # Ajustar largura das colunas
+            column_letter = get_column_letter(col)
+            column_len = max(df.iloc[:, col - 1].astype(str).map(len).max(), len(df.columns[col - 1])) + 2
+            worksheet.column_dimensions[column_letter].width = min(column_len, 30)
+
+        # Formatar células de dados
+        for row in range(2, len(df) + 2):
+            for col in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=row, column=col)
+                cell.border = border
+                cell.alignment = Alignment(horizontal='left', vertical='center')
+
+                # Formatar valores monetários
+                if 'valor' in df.columns[col - 1].lower() or 'total' in df.columns[col - 1].lower():
+                    cell.number_format = 'R$ #,##0.00'
+
+        # Congelar cabeçalho
+        worksheet.freeze_panes = 'A2'
+
+        # Auto-filtro
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+    processed_data = output.getvalue()
+    return processed_data
 
 
 # --- INICIALIZAÇÃO ---
@@ -194,12 +278,33 @@ def login_form():
             user = fetch_data("SELECT * FROM users WHERE username = ?", (username,))
             if not user.empty:
                 user_data = user.iloc[0]
-                if user_data['status'] == 'pending':
+
+                # Lida com a migração de senhas para usuários antigos (sem salt)
+                if user_data['salt'] is None:
+                    old_hashed_password = hashlib.sha256(str.encode(password)).hexdigest()
+                    if user_data['password'] == old_hashed_password:
+                        st.info("Atualizando a segurança da sua conta...")
+                        new_hashed_password, new_salt = hash_password(password)
+                        execute_query("UPDATE users SET password = ?, salt = ? WHERE username = ?",
+                                      (new_hashed_password, new_salt, username))
+
+                        st.session_state.logged_in = True
+                        st.session_state.username = user_data['username']
+                        st.session_state.role = user_data['role']
+                        st.toast("Conta atualizada com sucesso!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Usuário ou senha incorretos.")
+
+                # Login padrão para usuários com salt
+                elif user_data['status'] == 'pending':
                     st.warning("Sua conta está aguardando aprovação de um administrador.")
-                elif check_password(user_data['password'], password):
+                elif check_password(user_data['password'], user_data['salt'], password):
                     st.session_state.logged_in = True
                     st.session_state.username = user_data['username']
                     st.session_state.role = user_data['role']
+                    logging.info(f"Usuário '{username}' logado com sucesso.")
                     st.rerun()
                 else:
                     st.error("Usuário ou senha incorretos.")
@@ -225,21 +330,17 @@ def registration_form():
                 role = "admin"
                 status = "active"
             else:
-                if is_gestor:
-                    role = "gestor"
-                    status = "pending"
-                else:
-                    role = "user"
-                    status = "active"
+                role = "gestor" if is_gestor else "user"
+                status = "pending" if is_gestor else "active"
 
-            hashed_password = hash_password(new_password)
-            if execute_query("INSERT INTO users (username, password, role, status) VALUES (?, ?, ?, ?)",
-                             (new_username, hashed_password, role, status)):
+            hashed_password, salt = hash_password(new_password)
+            if execute_query("INSERT INTO users (username, password, salt, role, status) VALUES (?, ?, ?, ?, ?)",
+                             (new_username, hashed_password, salt, role, status)):
+                logging.info(f"Novo usuário '{new_username}' registrado como '{role}' (status: {status}).")
                 if status == 'pending':
-                    st.success(
-                        f"Usuário '{new_username}' registrado com sucesso! Sua conta aguarda aprovação de um administrador.")
+                    st.success(f"Usuário '{new_username}' registrado! Sua conta aguarda aprovação.")
                 else:
-                    st.success(f"Usuário '{new_username}' registrado com sucesso como '{role}'. Faça o login.")
+                    st.success(f"Usuário '{new_username}' registrado como '{role}'. Faça o login.")
                 time.sleep(2)
                 st.session_state.page = "Login"
                 st.rerun()
@@ -270,10 +371,11 @@ if 'pedido_edit_id' not in st.session_state: st.session_state.pedido_edit_id = N
 if 'show_pedido_form' not in st.session_state: st.session_state.show_pedido_form = False
 if 'rc_id_para_pedido' not in st.session_state: st.session_state.rc_id_para_pedido = None
 if 'confirm_reset' not in st.session_state: st.session_state.confirm_reset = False
-if 'confirm_pedido_delete' not in st.session_state: st.session_state.confirm_pedido_delete = None
+if 'confirm_delete' not in st.session_state: st.session_state.confirm_delete = {}
 if 'show_demanda_form' not in st.session_state: st.session_state.show_demanda_form = False
 if 'demanda_edit_id' not in st.session_state: st.session_state.demanda_edit_id = None
 if 'demanda_id_para_rc' not in st.session_state: st.session_state.demanda_id_para_rc = None
+if 'pedido_to_finalize' not in st.session_state: st.session_state.pedido_to_finalize = None
 
 # ==============================================================================
 # --- BARRA LATERAL (SIDEBAR) ---
@@ -281,13 +383,13 @@ if 'demanda_id_para_rc' not in st.session_state: st.session_state.demanda_id_par
 with st.sidebar:
     st.write(f"Usuário: **{st.session_state.username}** ({st.session_state.role})")
     if st.button("Logout", use_container_width=True):
+        logging.info(f"Usuário '{st.session_state.username}' deslogado.")
         for key in list(st.session_state.keys()): del st.session_state[key]
         st.rerun()
 
     if st.session_state.role == 'admin':
         st.header("Administração")
         with st.expander("Gerenciar Usuários"):
-            # Aprovações pendentes
             pending_users = fetch_data("SELECT id, username, role FROM users WHERE status = 'pending'")
             if not pending_users.empty:
                 st.subheader("Aprovações Pendentes")
@@ -298,16 +400,15 @@ with st.sidebar:
                     with col2:
                         if st.button("Aprovar", key=f"approve_{user['id']}", use_container_width=True):
                             execute_query("UPDATE users SET status = 'active' WHERE id = ?", (user['id'],))
-                            st.success(f"Usuário {user['username']} aprovado.")
+                            st.toast(f"Usuário {user['username']} aprovado.")
                             st.rerun()
                     with col3:
                         if st.button("Rejeitar", key=f"reject_{user['id']}", use_container_width=True):
                             execute_query("DELETE FROM users WHERE id = ?", (user['id'],))
-                            st.warning(f"Usuário {user['username']} rejeitado e excluído.")
+                            st.toast(f"Usuário {user['username']} rejeitado.", icon="🗑️")
                             st.rerun()
                 st.markdown("---")
 
-            # Gerenciar usuários ativos
             st.subheader("Usuários Ativos")
             all_users = fetch_data("SELECT id, username, role FROM users WHERE status = 'active'")
             st.dataframe(all_users, use_container_width=True, hide_index=True)
@@ -319,10 +420,10 @@ with st.sidebar:
                     new_pass = st.text_input("Nova Senha", type="password", key=f"new_pass_{selected_user}")
                     if st.form_submit_button("Salvar Nova Senha"):
                         if new_pass:
-                            hashed_pass = hash_password(new_pass)
-                            if execute_query("UPDATE users SET password = ? WHERE username = ?",
-                                             (hashed_pass, selected_user)):
-                                st.success(f"Senha de {selected_user} alterada com sucesso.")
+                            hashed_password, salt = hash_password(new_pass)
+                            if execute_query("UPDATE users SET password = ?, salt = ? WHERE username = ?",
+                                             (hashed_password, salt, selected_user)):
+                                st.toast(f"Senha de {selected_user} alterada.")
                         else:
                             st.warning("A nova senha não pode estar em branco.")
                 with st.form(f"change_role_{selected_user}"):
@@ -335,10 +436,10 @@ with st.sidebar:
                             "SELECT COUNT(id) as count FROM users WHERE role = 'admin' AND status = 'active'").iloc[0][
                             'count']
                         if current_role == 'admin' and num_admins <= 1 and new_role != 'admin':
-                            st.error("Não é possível remover o último administrador.")
+                            st.error("Operação negada: O sistema precisa de pelo menos um administrador.")
                         else:
                             if execute_query("UPDATE users SET role = ? WHERE username = ?", (new_role, selected_user)):
-                                st.success(f"O papel de {selected_user} foi alterado para {new_role}.")
+                                st.toast(f"Papel de {selected_user} alterado para {new_role}.")
                                 if selected_user == st.session_state.username:
                                     st.warning("Seu papel foi alterado. Você será deslogado.")
                                     time.sleep(2)
@@ -347,7 +448,7 @@ with st.sidebar:
                 if selected_user != st.session_state.username:
                     if st.button(f"Excluir {selected_user}", use_container_width=True, type="secondary"):
                         if execute_query("DELETE FROM users WHERE username = ?", (selected_user,)):
-                            st.success(f"Usuário {selected_user} excluído com sucesso.")
+                            st.toast(f"Usuário {selected_user} excluído.", icon="🗑️")
                             st.rerun()
                 else:
                     st.info("Você não pode excluir sua própria conta.")
@@ -361,7 +462,7 @@ with st.sidebar:
                     if st.button("Sim, apagar DADOS", use_container_width=True, type="primary"):
                         reset_database()
                         st.session_state.confirm_reset = False
-                        st.success("Dados zerados!")
+                        st.toast("Dados zerados!", icon="✅")
                         time.sleep(1)
                         st.rerun()
                 with c2:
@@ -373,8 +474,38 @@ with st.sidebar:
 # --- RENDERIZAÇÃO DE FORMULÁRIOS OU ABAS ---
 # ==============================================================================
 
-if st.session_state.show_rc_form:
-    # --- FORMULÁRIO DE ADIÇÃO/EDIÇÃO DE RC ---
+if st.session_state.show_demanda_form:
+    form_title = "Editar Demanda" if st.session_state.demanda_edit_id else "Adicionar Nova Demanda"
+    demanda_data = {}
+    if st.session_state.demanda_edit_id:
+        demanda_data_df = fetch_data("SELECT * FROM demandas WHERE id = ?", (st.session_state.demanda_edit_id,))
+        if not demanda_data_df.empty:
+            demanda_data = demanda_data_df.iloc[0].to_dict()
+
+    with st.form("demanda_form"):
+        st.subheader(form_title)
+        descricao_necessidade = st.text_area("Descrição da Necessidade",
+                                             value=demanda_data.get("descricao_necessidade", ""))
+
+        submitted = st.form_submit_button("Salvar Demanda")
+        if submitted:
+            if not descricao_necessidade:
+                st.warning("A descrição da necessidade é obrigatória.")
+            else:
+                if st.session_state.demanda_edit_id:
+                    params = (descricao_necessidade, st.session_state.demanda_edit_id)
+                    query = "UPDATE demandas SET descricao_necessidade=? WHERE id=?"
+                    if execute_query(query, params):
+                        st.toast("Demanda atualizada!")
+                        st.session_state.show_demanda_form = False
+                        st.session_state.demanda_edit_id = None
+                        st.rerun()
+    if st.button("Cancelar", key="cancel_demanda_form"):
+        st.session_state.show_demanda_form = False
+        st.session_state.demanda_edit_id = None
+        st.rerun()
+
+elif st.session_state.show_rc_form:
     form_title = "Editar RC" if st.session_state.edit_id else "Adicionar Nova RC"
     rc_data = {}
     demanda_origem = None
@@ -434,7 +565,7 @@ if st.session_state.show_rc_form:
                     st.session_state.edit_id)
                     q = "UPDATE requisicoes SET numero_rc=?, solicitante=?, centro_custo=?, tipo=?, fornecedor=?, descricao=?, valor=?, status=?, observacoes=? WHERE id=?"
                     if execute_query(q, params_db):
-                        st.success(f"RC Nº {numero_rc} atualizada!")
+                        st.toast(f"RC Nº {numero_rc} atualizada!")
                         st.session_state.show_rc_form = False
                         st.session_state.edit_id = None
                         st.rerun()
@@ -449,7 +580,7 @@ if st.session_state.show_rc_form:
                         if demanda_id:
                             execute_query("UPDATE demandas SET status_demanda = 'Em atendimento' WHERE id = ?",
                                           (demanda_id,))
-                        st.success("Nova RC adicionada!")
+                        st.toast("Nova RC adicionada!")
                         st.session_state.show_rc_form = False
                         st.session_state.demanda_id_para_rc = None
                         st.rerun()
@@ -460,7 +591,6 @@ if st.session_state.show_rc_form:
         st.rerun()
 
 elif st.session_state.show_pedido_form:
-    # --- FORMULÁRIO DE GERAÇÃO/EDIÇÃO DE PEDIDO ---
     form_title_pedido = "Editar Pedido de Compra" if st.session_state.pedido_edit_id else "Gerar Novo Pedido de Compra"
     pedido_data = {}
     rc_origem_id = st.session_state.rc_id_para_pedido
@@ -502,7 +632,7 @@ elif st.session_state.show_pedido_form:
                 numero_pedido, previsao_entrega_str, status_pedido, observacoes_pedido, st.session_state.pedido_edit_id)
                 q_pedido = "UPDATE pedidos SET numero_pedido=?, previsao_entrega=?, status_pedido=?, observacoes_pedido=? WHERE id=?"
                 if execute_query(q_pedido, params_db_pedido):
-                    st.success(f"Pedido Nº {st.session_state.pedido_edit_id} atualizado!")
+                    st.toast(f"Pedido Nº {st.session_state.pedido_edit_id} atualizado!")
                     st.session_state.show_pedido_form = False
                     st.session_state.pedido_edit_id = None
                     st.rerun()
@@ -512,7 +642,7 @@ elif st.session_state.show_pedido_form:
                 rc_origem_id, data_pedido, numero_pedido, previsao_entrega_str, status_pedido, observacoes_pedido)
                 q_pedido = "INSERT INTO pedidos (rc_id, data_pedido, numero_pedido, previsao_entrega, status_pedido, observacoes_pedido) VALUES (?, ?, ?, ?, ?, ?)"
                 if execute_query(q_pedido, params_db_pedido):
-                    st.success("Novo pedido de compra gerado!")
+                    st.toast("Novo pedido de compra gerado!")
                     st.session_state.show_pedido_form = False
                     st.session_state.rc_id_para_pedido = None
                     st.rerun()
@@ -524,7 +654,66 @@ elif st.session_state.show_pedido_form:
 
 else:
     # --- VISUALIZAÇÃO DAS ABAS ---
-    tab_demandas, tab_rcs, tab_pedidos = st.tabs(["Demandas de Compras", "Requisições (RCs)", "Pedidos de Compra"])
+    tab_dashboard, tab_demandas, tab_rcs, tab_pedidos_andamento, tab_pedidos_finalizados = st.tabs(
+        ["📊 Dashboard", "📝 Demandas de Compras", "🛒 Requisições (RCs)", "🚚 Pedidos em Andamento",
+         "✅ Pedidos Finalizados"])
+
+    with tab_dashboard:
+        st.header("Dashboard de Métricas")
+
+        with st.expander("Filtros do Dashboard"):
+            solicitantes_dash = fetch_data("SELECT DISTINCT solicitante_demanda FROM demandas")
+            solicitante_list_dash = solicitantes_dash['solicitante_demanda'].tolist()
+            filtro_solicitante_dash = st.multiselect("Filtrar por Solicitante da Demanda",
+                                                     options=solicitante_list_dash)
+
+        # Constrói a cláusula WHERE para as queries
+        where_clause_demanda = ""
+        params_demanda_dash = []
+        if filtro_solicitante_dash:
+            where_clause_demanda = f"AND solicitante_demanda IN ({','.join(['?'] * len(filtro_solicitante_dash))})"
+            params_demanda_dash.extend(filtro_solicitante_dash)
+
+        with st.spinner("Carregando métricas..."):
+            query_total_gasto = f"""
+                SELECT SUM(r.valor) as total 
+                FROM requisicoes r 
+                JOIN demandas d ON r.demanda_id = d.id 
+                WHERE r.status = 'Finalizado' {where_clause_demanda.replace('solicitante_demanda', 'd.solicitante_demanda')}
+            """
+            total_rcs_finalizadas = fetch_data(query_total_gasto, tuple(params_demanda_dash)).iloc[0]['total'] or 0
+
+            demandas_abertas = fetch_data(
+                f"SELECT COUNT(id) as count FROM demandas WHERE status_demanda = 'Aberta' {where_clause_demanda}",
+                tuple(params_demanda_dash)).iloc[0]['count']
+
+            query_rcs_abertas = f"""
+                SELECT COUNT(r.id) as count 
+                FROM requisicoes r 
+                JOIN demandas d ON r.demanda_id = d.id 
+                WHERE r.status = 'Aberto' {where_clause_demanda.replace('solicitante_demanda', 'd.solicitante_demanda')}
+            """
+            rcs_abertas = fetch_data(query_rcs_abertas, tuple(params_demanda_dash)).iloc[0]['count']
+
+            query_pedidos_andamento = f"""
+                SELECT COUNT(p.id) as count 
+                FROM pedidos p 
+                JOIN requisicoes r ON p.rc_id = r.id 
+                JOIN demandas d ON r.demanda_id = d.id 
+                WHERE p.status_pedido NOT IN ('Entregue', 'Cancelado') {where_clause_demanda.replace('solicitante_demanda', 'd.solicitante_demanda')}
+            """
+            pedidos_andamento = fetch_data(query_pedidos_andamento, tuple(params_demanda_dash)).iloc[0]['count']
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(label="Total Gasto (RCs Finalizadas)", value=format_currency(total_rcs_finalizadas))
+        with col2:
+            st.metric(label="Demandas Abertas", value=demandas_abertas)
+        with col3:
+            st.metric(label="RCs Abertas", value=rcs_abertas)
+        with col4:
+            st.metric(label="Pedidos em Andamento", value=pedidos_andamento)
+
     with tab_demandas:
         st.header("Demandas de Compras")
 
@@ -551,23 +740,44 @@ else:
                         anexo_path, 'Aberta')
                         query = "INSERT INTO demandas (data_demanda, solicitante_demanda, descricao_necessidade, anexo_path, status_demanda) VALUES (?, ?, ?, ?, ?)"
                         if execute_query(query, params):
-                            st.success("Nova demanda registrada com sucesso!")
+                            st.toast("Nova demanda registrada com sucesso!")
                             st.rerun()
 
+        with st.expander("🔍 Filtros e Busca"):
+            filtro_busca_demanda = st.text_input("Buscar na descrição da demanda")
+
+            # Filtro por gestor
+            solicitantes = fetch_data("SELECT DISTINCT solicitante_demanda FROM demandas")
+            solicitante_list = solicitantes['solicitante_demanda'].tolist()
+            filtro_solicitante = st.multiselect("Filtrar por Solicitante", options=solicitante_list)
+
+        query_demanda = "SELECT * FROM demandas WHERE 1=1"
+        params_demanda = []
+        if filtro_busca_demanda:
+            query_demanda += " AND descricao_necessidade LIKE ?"
+            params_demanda.append(f"%{filtro_busca_demanda}%")
+        if filtro_solicitante:
+            query_demanda += f" AND solicitante_demanda IN ({','.join(['?'] * len(filtro_solicitante))})"
+            params_demanda.extend(filtro_solicitante)
+        query_demanda += " ORDER BY id DESC"
+
+        with st.spinner("Carregando demandas..."):
+            df_demandas = fetch_data(query_demanda, tuple(params_demanda))
+
         st.header("Lista de Demandas")
-        df_demandas = fetch_data("SELECT * FROM demandas ORDER BY id DESC")
         if df_demandas.empty:
-            st.info("Nenhuma demanda registrada.")
+            st.info("Nenhuma demanda encontrada.")
         else:
             for index, row in df_demandas.iterrows():
                 st.markdown("---")
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     status_demanda = row.get('status_demanda', 'Status Indefinido')
-                    st.subheader(f"Demanda Nº {row['id']} - Status: {status_demanda}")
+                    status_emoji = "🔵" if status_demanda == "Aberta" else "🟢" if status_demanda == "Em atendimento" else "🔴"
+                    st.subheader(f"Demanda Nº {row['id']} - Status: {status_emoji} {status_demanda}")
                     st.write(f"**Solicitante:** {row['solicitante_demanda']}")
                     st.write(
-                        f"**Data:** {datetime.strptime(row['data_demanda'], '%Y-%m-%d %H:%M:%S').strftime('%d/%m/%Y')}")
+                        f"**Data:** {safe_strptime(row['data_demanda'], '%Y-%m-%d %H:%M:%S').strftime('%d/%m/%Y') if safe_strptime(row['data_demanda'], '%Y-%m-%d %H:%M:%S') else 'Data inválida'}")
                     st.info(f"**Necessidade:** {row['descricao_necessidade']}")
                 with col2:
                     if row['anexo_path'] and os.path.exists(row['anexo_path']):
@@ -594,24 +804,48 @@ else:
                             except Exception as e:
                                 st.warning("Não foi possível carregar o anexo para download.")
 
-                action_col1, action_col2 = st.columns([1, 4])
-                with action_col1:
+                c1, c2, c3 = st.columns([1, 1, 3])
+                with c1:
+                    if row['solicitante_demanda'] == st.session_state.username or st.session_state.role in ['admin',
+                                                                                                            'gestor']:
+                        if st.button("✏️ Editar", key=f"edit_demanda_{row['id']}"):
+                            st.session_state.demanda_edit_id = row['id']
+                            st.session_state.show_demanda_form = True
+                            st.rerun()
+                with c2:
                     if row['solicitante_demanda'] == st.session_state.username or st.session_state.role == 'admin':
                         if st.button("🗑️ Excluir", key=f"del_demanda_{row['id']}", type="secondary"):
-                            execute_query("DELETE FROM demandas WHERE id = ?", (row['id'],))
-                            if row['anexo_path'] and os.path.exists(row['anexo_path']):
-                                os.remove(row['anexo_path'])
-                            st.success("Demanda excluída.")
+                            st.session_state.confirm_delete['demanda'] = row['id']
                             st.rerun()
-                with action_col2:
+
+                if st.session_state.confirm_delete.get('demanda') == row['id']:
+                    st.warning(f"Tem certeza que deseja excluir a Demanda Nº {row['id']}?")
+                    del_c1, del_c2 = st.columns(2)
+                    with del_c1:
+                        if st.button("Sim, excluir demanda", key=f"confirm_del_demanda_{row['id']}",
+                                     use_container_width=True):
+                            if execute_query("DELETE FROM demandas WHERE id = ?", (row['id'],)):
+                                if row['anexo_path'] and os.path.exists(row['anexo_path']):
+                                    os.remove(row['anexo_path'])
+                                st.toast("Demanda excluída.", icon="🗑️")
+                                st.session_state.confirm_delete = {}
+                                st.rerun()
+                    with del_c2:
+                        if st.button("Cancelar", key=f"cancel_del_demanda_{row['id']}", use_container_width=True):
+                            st.session_state.confirm_delete = {}
+                            st.rerun()
+
+                with c3:
                     status_demanda = row.get('status_demanda', 'Aberta')
                     if status_demanda == 'Aberta' and st.session_state.role != 'gestor':
-                        if st.button("🛒 Criar RC a partir desta Demanda", key=f"create_rc_{row['id']}", type="primary"):
+                        if st.button("🛒 Criar RC", key=f"create_rc_{row['id']}", type="primary"):
                             st.session_state.demanda_id_para_rc = row['id']
                             st.session_state.show_rc_form = True
                             st.rerun()
-                    elif status_demanda != 'Aberta':
+                    elif status_demanda == 'Em atendimento':
                         st.success("✔️ Demanda em atendimento (RC criada).")
+                    elif status_demanda == 'Finalizada':
+                        st.error("✔️ Demanda Finalizada (Pedido Entregue).")
 
     with tab_rcs:
         st.header("Requisições de Compra (RCs)")
@@ -622,10 +856,44 @@ else:
                 st.session_state.demanda_id_para_rc = None
                 st.rerun()
 
+        # --- FILTROS E RELATÓRIOS DE RC ---
+        with st.expander("Filtros e Relatórios de RCs"):
+            rc_status_list = ["Aberto", "Finalizado", "Cancelado"]
+            filtro_status_rc = st.multiselect("Filtrar por Status da RC", options=rc_status_list)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                filtro_data_inicio_rc = st.date_input("Data de Início da RC", value=None)
+            with c2:
+                filtro_data_fim_rc = st.date_input("Data de Fim da RC", value=None)
+
+        query_rc = "SELECT * FROM requisicoes WHERE 1=1"
+        params_rc = []
+        if filtro_status_rc:
+            query_rc += f" AND status IN ({','.join(['?'] * len(filtro_status_rc))})"
+            params_rc.extend(filtro_status_rc)
+        if filtro_data_inicio_rc:
+            query_rc += " AND date(data_criacao) >= ?"
+            params_rc.append(filtro_data_inicio_rc)
+        if filtro_data_fim_rc:
+            query_rc += " AND date(data_criacao) <= ?"
+            params_rc.append(filtro_data_fim_rc)
+        query_rc += " ORDER BY id DESC"
+
+        with st.spinner("Carregando requisições..."):
+            df_rc = fetch_data(query_rc, tuple(params_rc))
+
+        if not df_rc.empty:
+            st.download_button(
+                label="📥 Exportar RCs para Excel",
+                data=to_excel(df_rc, "Relatório de RCs"),
+                file_name='relatorio_rcs.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            )
+
         st.header("Lista de Requisições")
-        df_rc = fetch_data("SELECT * FROM requisicoes ORDER BY id DESC")
         if df_rc.empty:
-            st.info("Nenhuma RC encontrada.")
+            st.info("Nenhuma RC encontrada com os filtros aplicados.")
         else:
             df_display_rc = df_rc.copy()
             df_display_rc['valor'] = df_display_rc['valor'].apply(format_currency)
@@ -646,9 +914,33 @@ else:
                             st.rerun()
                     with col_delete:
                         if st.button("🗑️ Excluir RC", use_container_width=True, type="secondary"):
-                            if execute_query("DELETE FROM requisicoes WHERE id = ?", (selected_id_rc,)):
-                                st.success(f"RC Nº {selected_id_rc} excluída!")
+                            st.session_state.confirm_delete['rc'] = selected_id_rc
+                            st.rerun()
+
+                    if st.session_state.confirm_delete.get('rc') == selected_id_rc:
+                        pedidos_associados = fetch_data("SELECT id FROM pedidos WHERE rc_id = ?", (selected_id_rc,))
+                        if not pedidos_associados.empty:
+                            st.error(
+                                f"Não é possível excluir a RC Nº {selected_id_rc}, pois ela possui pedidos associados.")
+                            if st.button("Ok, entendi", key=f"ack_del_rc_{selected_id_rc}"):
+                                st.session_state.confirm_delete = {}
                                 st.rerun()
+                        else:
+                            st.warning(f"Tem certeza que deseja excluir a RC Nº {selected_id_rc}?")
+                            del_c1, del_c2 = st.columns(2)
+                            with del_c1:
+                                if st.button("Sim, excluir RC", key=f"confirm_del_rc_{selected_id_rc}",
+                                             use_container_width=True):
+                                    if execute_query("DELETE FROM requisicoes WHERE id = ?", (selected_id_rc,)):
+                                        st.toast(f"RC Nº {selected_id_rc} excluída!", icon="🗑️")
+                                        st.session_state.confirm_delete = {}
+                                        st.rerun()
+                            with del_c2:
+                                if st.button("Cancelar", key=f"cancel_del_rc_{selected_id_rc}",
+                                             use_container_width=True):
+                                    st.session_state.confirm_delete = {}
+                                    st.rerun()
+
                     selected_rc_details = df_rc[df_rc['id'] == selected_id_rc].iloc[0]
                     if selected_rc_details['status'] == 'Finalizado':
                         pedido_existente = fetch_data("SELECT id FROM pedidos WHERE rc_id = ?", (selected_id_rc,))
@@ -662,12 +954,46 @@ else:
                             else:
                                 st.info(f"Pedido já existe.")
 
-    with tab_pedidos:
-        st.header("Pedidos de Compra Gerados")
-        query_pedidos = "SELECT p.id, p.rc_id, r.numero_rc, p.data_pedido, p.numero_pedido, p.previsao_entrega, p.status_pedido, r.solicitante, p.observacoes_pedido FROM requisicoes r JOIN pedidos p ON r.id = p.rc_id ORDER BY p.id DESC"
-        df_pedidos = fetch_data(query_pedidos)
+    with tab_pedidos_andamento:
+        st.header("Pedidos de Compra em Andamento")
+
+        # --- FILTROS E RELATÓRIOS DE PEDIDOS ---
+        with st.expander("Filtros e Relatórios de Pedidos"):
+            pedido_status_list = ["Aguardando Entrega", "Entregue Parcialmente", "Atrasado", "Cancelado"]
+            filtro_status_pedido = st.multiselect("Filtrar por Status do Pedido", options=pedido_status_list)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                filtro_data_inicio_pedido = st.date_input("Data de Início do Pedido", value=None)
+            with c2:
+                filtro_data_fim_pedido = st.date_input("Data de Fim do Pedido", value=None)
+
+        query_pedidos = "SELECT p.id, p.rc_id, r.numero_rc, p.data_pedido, p.numero_pedido, p.previsao_entrega, p.status_pedido, r.solicitante, p.observacoes_pedido FROM requisicoes r JOIN pedidos p ON r.id = p.rc_id WHERE p.status_pedido != 'Entregue'"
+        params_pedidos = []
+        if filtro_status_pedido:
+            query_pedidos += f" AND p.status_pedido IN ({','.join(['?'] * len(filtro_status_pedido))})"
+            params_pedidos.extend(filtro_status_pedido)
+        if filtro_data_inicio_pedido:
+            query_pedidos += " AND date(p.data_pedido) >= ?"
+            params_pedidos.append(filtro_data_inicio_pedido)
+        if filtro_data_fim_pedido:
+            query_pedidos += " AND date(p.data_pedido) <= ?"
+            params_pedidos.append(filtro_data_fim_pedido)
+        query_pedidos += " ORDER BY p.id DESC"
+
+        with st.spinner("Carregando pedidos..."):
+            df_pedidos = fetch_data(query_pedidos, tuple(params_pedidos))
+
+        if not df_pedidos.empty:
+            st.download_button(
+                label="📥 Exportar Pedidos para Excel",
+                data=to_excel(df_pedidos, "Pedidos em Andamento"),
+                file_name='pedidos_em_andamento.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            )
+
         if df_pedidos.empty:
-            st.info("Nenhum pedido de compra encontrado.")
+            st.info("Nenhum pedido de compra encontrado com os filtros aplicados.")
         else:
             st.dataframe(df_pedidos, use_container_width=True, hide_index=True)
             if st.session_state.role != 'gestor':
@@ -676,7 +1002,7 @@ else:
                 selected_id_pedido = st.selectbox("Selecione um Pedido", options=pedido_ids,
                                                   format_func=lambda x: f"Pedido Nº {x}", key="select_pedido")
                 if selected_id_pedido:
-                    col_edit, col_delete, col_space = st.columns([1.5, 1.5, 7])
+                    col_edit, col_delete, col_finalize, col_space = st.columns([1.5, 1.5, 2, 5])
                     with col_edit:
                         if st.button("✏️ Editar Pedido", use_container_width=True):
                             st.session_state.pedido_edit_id = selected_id_pedido
@@ -684,19 +1010,69 @@ else:
                             st.rerun()
                     with col_delete:
                         if st.button("🗑️ Excluir Pedido", use_container_width=True, type="secondary"):
-                            st.session_state.confirm_pedido_delete = selected_id_pedido
+                            st.session_state.confirm_delete['pedido'] = selected_id_pedido
                             st.rerun()
-                    if st.session_state.confirm_pedido_delete == selected_id_pedido:
+
+                    selected_pedido_details = df_pedidos[df_pedidos['id'] == selected_id_pedido].iloc[0]
+                    if selected_pedido_details['status_pedido'] not in ['Entregue', 'Cancelado']:
+                        with col_finalize:
+                            if st.button("✅ Finalizar Pedido", use_container_width=True):
+                                st.session_state.pedido_to_finalize = selected_id_pedido
+                                st.rerun()
+
+                    if st.session_state.confirm_delete.get('pedido') == selected_id_pedido:
                         st.warning(f"Tem certeza que deseja excluir o Pedido Nº {selected_id_pedido}?")
                         c1, c2 = st.columns(2)
                         with c1:
                             if st.button("Sim, excluir pedido", use_container_width=True, type="primary"):
                                 if execute_query("DELETE FROM pedidos WHERE id = ?", (selected_id_pedido,)):
-                                    st.success(f"Pedido Nº {selected_id_pedido} excluído!")
-                                    st.session_state.confirm_pedido_delete = None
-                                    time.sleep(1)
+                                    st.toast(f"Pedido Nº {selected_id_pedido} excluído!", icon="🗑️")
+                                    st.session_state.confirm_delete = {}
                                     st.rerun()
                         with c2:
                             if st.button("Cancelar exclusão", use_container_width=True):
-                                st.session_state.confirm_pedido_delete = None
+                                st.session_state.confirm_delete = {}
                                 st.rerun()
+
+                    if 'pedido_to_finalize' in st.session_state and st.session_state.pedido_to_finalize == selected_id_pedido:
+                        st.warning("Tem certeza que deseja marcar este pedido como FINALIZADO?")
+                        st.info("Esta ação irá:")
+                        st.info("- Marcar o pedido como 'Entregue'")
+                        st.info("- Atualizar a demanda relacionada para 'Finalizado'")
+
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("Sim, Finalizar Pedido", use_container_width=True, type="primary"):
+                                # Atualiza o status do pedido
+                                if execute_query("UPDATE pedidos SET status_pedido = 'Entregue' WHERE id = ?",
+                                                 (selected_id_pedido,)):
+                                    # Busca a RC relacionada ao pedido
+                                    rc_info = fetch_data(
+                                        "SELECT demanda_id FROM requisicoes WHERE id = (SELECT rc_id FROM pedidos WHERE id = ?)",
+                                        (selected_id_pedido,))
+                                    if not rc_info.empty and rc_info.iloc[0]['demanda_id']:
+                                        execute_query("UPDATE demandas SET status_demanda = 'Finalizada' WHERE id = ?",
+                                                      (rc_info.iloc[0]['demanda_id'],))
+                                    st.toast(f"Pedido Nº {selected_id_pedido} finalizado com sucesso!")
+                                    del st.session_state.pedido_to_finalize
+                                    st.rerun()
+                        with c2:
+                            if st.button("Cancelar", use_container_width=True):
+                                del st.session_state.pedido_to_finalize
+                                st.rerun()
+
+    with tab_pedidos_finalizados:
+        st.header("Pedidos de Compra Finalizados")
+        query_finalizados = "SELECT p.id, p.rc_id, r.numero_rc, p.data_pedido, p.numero_pedido, p.previsao_entrega, p.status_pedido, r.solicitante, p.observacoes_pedido FROM requisicoes r JOIN pedidos p ON r.id = p.rc_id WHERE p.status_pedido = 'Entregue' ORDER BY p.id DESC"
+        df_finalizados = fetch_data(query_finalizados)
+        if df_finalizados.empty:
+            st.info("Nenhum pedido finalizado encontrado.")
+        else:
+            if not df_finalizados.empty:
+                st.download_button(
+                    label="📥 Exportar Pedidos Finalizados para Excel",
+                    data=to_excel(df_finalizados, "Pedidos Finalizados"),
+                    file_name='pedidos_finalizados.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                )
+            st.dataframe(df_finalizados, use_container_width=True, hide_index=True)
