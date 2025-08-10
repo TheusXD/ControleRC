@@ -1,0 +1,20 @@
+# Banco de dados
+controle_rcs.db
+
+# Pasta de uploads
+uploads/
+
+# Arquivos de log
+*.log
+
+# Cache do Streamlit
+.streamlit/
+
+# Pastas de cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
