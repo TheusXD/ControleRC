@@ -1,7 +1,7 @@
-fpdf2
 streamlit
 pandas
-fpdf2
 openpyxl
-Pyrebase4
-supabase
+firebase-admin
+pydantic
+plotly
+fpdf

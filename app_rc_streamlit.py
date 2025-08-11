@@ -3,679 +3,1124 @@ import pandas as pd
 import os
 import time
 import hashlib
-from datetime import datetime, date
-from PIL import Image
-import logging
+from datetime import datetime, timedelta, date
 import io
+import openpyxl
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+import plotly.express as px
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import create_engine, text
-from supabase import create_client
+from pydantic import BaseModel, Field, constr
+from typing import List, Dict, Any, Optional, Tuple
+import re
+import logging
+import json
+import tempfile
+import base64
+from fpdf import FPDF
+
+# Configurar o logging para monitorizar a aplicação
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Controle de Compras", layout="wide")
 
-# --- CONFIGURAÇÃO DE LOGGING ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='app_log.log',
-    filemode='a'
-)
 
-# --- FUNÇÕES DE BANCO DE DADOS (SUPABASE) ---
-def get_db_connection():
-    """Cria uma conexão segura com o Supabase via SQLAlchemy."""
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        host = url.split("//")[1]
-        engine = create_engine(f"postgresql://postgres:{key}@{host}/postgres")
-        return engine
-    except Exception as e:
-        st.error(f"Erro ao conectar ao banco de dados: {e}")
-        st.stop()
+# -----------------------------------------------------------------------------
+# 1. MODELS (VALIDAÇÃO DE DADOS COM PYDANTIC)
+# -----------------------------------------------------------------------------
 
-def fetch_data(query, params=None):
-    """Executa uma query de leitura e retorna um DataFrame."""
-    try:
-        engine = get_db_connection()
-        with engine.connect() as conn:
-            result = conn.execute(text(query), params or {})
-            df = pd.DataFrame(result.fetchall(), columns=result.keys())
-        return df
-    except Exception as e:
-        st.error(f"Erro ao buscar dados: {e}")
-        return pd.DataFrame()
+class Demanda(BaseModel):
+    """Schema de validação para uma Demanda."""
+    solicitante_demanda: constr(min_length=1)
+    descricao_necessidade: constr(min_length=5)
+    categoria: constr(min_length=1)
+    anexo_path: Optional[str] = None
+    status_demanda: str = "Aberta"
+    created_at: datetime = Field(default_factory=datetime.now)
+    historico: List[str] = []
 
-def execute_query(query, params=None):
-    """Executa uma query de escrita (INSERT, UPDATE, DELETE)."""
-    try:
-        engine = get_db_connection()
-        with engine.connect() as conn:
-            with conn.begin():
-                conn.execute(text(query), params or {})
+
+class Requisicao(BaseModel):
+    """Schema de validação para uma Requisição."""
+    solicitante: constr(min_length=1)
+    demanda_id: Optional[str] = None
+    numero_rc: Optional[str] = None
+    valor: float = Field(..., gt=0)
+    status: str = "Aberto"
+    created_at: datetime = Field(default_factory=datetime.now)
+    historico: List[str] = []
+
+
+class Pedido(BaseModel):
+    """Schema de validação para um Pedido."""
+    requisicao_id: constr(min_length=1)
+    solicitante: constr(min_length=1)
+    valor: float = Field(..., gt=0)
+    numero_pedido: Optional[str] = None
+    status: str = "Em Processamento"
+    created_at: datetime = Field(default_factory=datetime.now)
+    observacao: Optional[str] = None
+    data_entrega: Optional[datetime] = None
+    historico: List[str] = []
+
+
+# -----------------------------------------------------------------------------
+# 2. SERVICES (LÓGICA DE NEGÓCIOS E ACESSO A DADOS)
+# -----------------------------------------------------------------------------
+
+class FirebaseService:
+    """Classe para encapsular todas as interações com o Firebase."""
+
+    def __init__(self, creds: Dict[str, Any]):
+        """Inicializa a conexão com o Firebase."""
+        if not firebase_admin._apps:
+            cred_dict = creds
+            # Corrige a formatação da chave privada lida dos secrets do Streamlit
+            cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
+            cert = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cert)
+        self.db = firestore.client()
+
+    def get_doc(self, collection: str, doc_id: str) -> Optional[Dict[str, Any]]:
+        """Busca um único documento pelo ID."""
+        try:
+            doc = self.db.collection(collection).document(doc_id).get()
+            if doc.exists:
+                doc_data = doc.to_dict()
+                doc_data['id'] = doc.id
+                return doc_data
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao buscar documento {doc_id} de '{collection}': {e}", exc_info=True)
+            return None
+
+    def get_docs(self, collection: str, filters: Optional[List[Tuple]] = None) -> pd.DataFrame:
+        """Busca documentos de uma coleção, com a opção de aplicar filtros."""
+        try:
+            logger.info(f"Obtendo documentos da coleção: {collection} com filtros: {filters}")
+            query = self.db.collection(collection)
+            if filters:
+                for f in filters:
+                    query = query.where(filter=firestore.FieldFilter(f[0], f[1], f[2]))
+
+            docs = query.stream()
+            data = []
+            for doc in docs:
+                doc_data = doc.to_dict()
+                doc_data['id'] = doc.id
+                # Converte timestamps do Firebase para objetos datetime do Python
+                for key, value in doc_data.items():
+                    if isinstance(value, datetime):
+                        doc_data[key] = value
+                data.append(doc_data)
+
+            logger.info(f"Foram obtidos {len(data)} documentos da coleção: {collection}")
+            df = pd.DataFrame(data) if data else pd.DataFrame()
+            # Ordena os dados pela data de criação para mostrar os mais recentes primeiro
+            if 'created_at' in df.columns:
+                df['created_at'] = pd.to_datetime(df['created_at'])
+                df = df.sort_values(by='created_at', ascending=False)
+            return df
+        except Exception as e:
+            logger.error(f"Erro ao obter dados de '{collection}': {e}", exc_info=True)
+            st.error(f"Erro ao buscar dados de '{collection}': {e}")
+            return pd.DataFrame()
+
+    def add_doc(self, collection: str, data: Dict[str, Any]) -> bool:
+        """Adiciona um novo documento a uma coleção."""
+        try:
+            logger.info(f"Adicionando documento à coleção: {collection}")
+            self.db.collection(collection).add(data)
+            logger.info(f"Documento adicionado com sucesso à coleção: {collection}")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao adicionar documento a '{collection}': {e}", exc_info=True)
+            st.error(f"Erro ao adicionar em '{collection}': {e}")
+            return False
+
+    def update_doc(self, collection: str, doc_id: str, new_data: Dict[str, Any], username: str) -> bool:
+        """Atualiza um documento e registra as alterações no histórico."""
+        try:
+            logger.info(f"Atualizando documento ID: {doc_id} na coleção: {collection} por {username}")
+            doc_ref = self.db.collection(collection).document(doc_id)
+            current_doc = doc_ref.get()
+            if not current_doc.exists:
+                st.error("Documento não encontrado para atualização.")
+                return False
+
+            old_data = current_doc.to_dict()
+            history_log = old_data.get('historico', [])
+            now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
+
+            for key, value in new_data.items():
+                old_value = old_data.get(key)
+                # Normaliza valores para comparação (ex: None vs "")
+                if (old_value or "") != (value or ""):
+                    log_entry = f"'{key.replace('_', ' ').capitalize()}' alterado de '{old_value}' para '{value}' por {username} em {now_str}"
+                    history_log.append(log_entry)
+
+            new_data['historico'] = history_log
+            doc_ref.update(new_data)
+            logger.info(f"Documento ID: {doc_id} atualizado com sucesso.")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao atualizar documento ID: {doc_id} em '{collection}': {e}", exc_info=True)
+            st.error(f"Erro ao atualizar em '{collection}': {e}")
+            return False
+
+    def delete_doc(self, collection: str, doc_id: str) -> bool:
+        """Exclui um documento."""
+        try:
+            logger.info(f"Excluindo documento ID: {doc_id} da coleção: {collection}")
+            self.db.collection(collection).document(doc_id).delete()
+            logger.info(f"Documento ID: {doc_id} excluído com sucesso da coleção: {collection}")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao excluir documento ID: {doc_id} de '{collection}': {e}", exc_info=True)
+            st.error(f"Erro ao excluir de '{collection}': {e}")
+            return False
+
+    def restore_from_backup_data(self, backup_data: Dict[str, Any]) -> bool:
+        """Restaura o banco de dados a partir de um dicionário de dados."""
+        try:
+            # Apaga todas as coleções atuais
+            collections_to_restore = ["users", "demandas", "requisicoes", "pedidos"]
+            for col in collections_to_restore:
+                docs_stream = self.db.collection(col).stream()
+                for doc in docs_stream:
+                    doc.reference.delete()
+
+            # Restaura os dados
+            for collection_name, documents in backup_data.items():
+                if collection_name not in collections_to_restore:
+                    continue
+                for doc_data in documents:
+                    # Converte strings de volta para datetime e bytes
+                    if 'created_at' in doc_data and isinstance(doc_data['created_at'], str):
+                        doc_data['created_at'] = datetime.fromisoformat(doc_data['created_at'])
+                    if 'data_entrega' in doc_data and isinstance(doc_data.get('data_entrega'), str):
+                        doc_data['data_entrega'] = datetime.fromisoformat(doc_data['data_entrega']) if doc_data[
+                            'data_entrega'] else None
+                    if 'password' in doc_data and isinstance(doc_data['password'], str):
+                        doc_data['password'] = base64.b64decode(doc_data['password'])
+                    if 'salt' in doc_data and isinstance(doc_data['salt'], str):
+                        doc_data['salt'] = base64.b64decode(doc_data['salt'])
+                    self.db.collection(collection_name).add(doc_data)
+
+            logger.info("Backup restaurado com sucesso!")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao restaurar o backup: {e}", exc_info=True)
+            st.error(f"Falha ao restaurar o backup: {e}")
+            return False
+
+
+class AuthService:
+    """Classe para gerenciar a autenticação de usuários."""
+    SESSION_TIMEOUT_MINUTES = 30
+
+    def __init__(self, db_service: FirebaseService):
+        self.db = db_service
+
+    def _hash_password(self, password: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+        """Gera o hash de uma senha com um salt para segurança."""
+        if salt is None:
+            salt = os.urandom(16)
+        hashed_password = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+        return hashed_password, salt
+
+    def _check_password(self, stored_password, salt, provided_password: str) -> bool:
+        """Verifica se a senha fornecida corresponde ao hash armazenado, lidando com tipos de dados inconsistentes."""
+        if salt is None or stored_password is None:
+            return False
+
+        # CORREÇÃO: Garante que o salt seja bytes. Se for uma string, assume que é base64 e decodifica.
+        if isinstance(salt, str):
+            try:
+                salt = base64.b64decode(salt)
+            except (ValueError, TypeError):
+                logger.error("O 'salt' no banco de dados está em um formato de string inválido.")
+                return False
+
+        # CORREÇÃO: Garante que a senha armazenada seja bytes.
+        if isinstance(stored_password, str):
+            try:
+                stored_password = base64.b64decode(stored_password)
+            except (ValueError, TypeError):
+                logger.error("A senha armazenada no banco de dados está em um formato de string inválido.")
+                return False
+
+        # Agora que ambos são bytes, podemos comparar.
+        return stored_password == hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
+
+    def _validate_password_strength(self, password: str) -> bool:
+        """Verifica se a senha atende aos critérios de força (comprimento, caracteres)."""
+        if len(password) < 8: return False
+        if not re.search(r"[A-Z]", password): return False
+        if not re.search(r"[a-z]", password): return False
+        if not re.search(r"[0-9]", password): return False
         return True
-    except Exception as e:
-        st.error(f"Erro no banco de dados: {e}")
+
+    def register_user(self, username, password, is_gestor):
+        """Registra um novo usuário com validação de senha e atribuição de papel."""
+        logger.info(f"Tentativa de registro do usuário: {username}")
+        if not self._validate_password_strength(password):
+            logger.error(f"Falha na validação da força da senha para o usuário: {username}")
+            st.error("A senha deve ter no mínimo 8 caracteres, com uma letra maiúscula, uma minúscula e um número.")
+            return
+
+        existing_user = self.db.get_docs("users", [("username", "==", username)])
+        if not existing_user.empty:
+            logger.warning(f"Falha no registro: O nome de usuário {username} já existe.")
+            st.error("Este nome de usuário já existe.");
+            return
+
+        all_users = self.db.get_docs("users")
+        # O primeiro usuário é admin, os outros são 'user' ou 'gestor' (pendente de aprovação)
+        role = "admin" if all_users.empty else "gestor" if is_gestor else "user"
+        status = "active" if role == "admin" or not is_gestor else "pending"
+
+        hashed_pw, salt = self._hash_password(password)
+        user_data = {"username": username, "password": hashed_pw, "salt": salt, "role": role, "status": status,
+                     "created_at": datetime.now()}
+
+        if self.db.add_doc("users", user_data):
+            logger.info(f"Usuário {username} registrado com sucesso com o papel: {role} e estado: {status}")
+            st.success(f"Usuário '{username}' registrado como '{role}'. Status: {status}")
+            time.sleep(2);
+            st.session_state.page = "Login";
+            st.rerun()
+
+    def login_user(self, username, password):
+        """Faz o login do usuário e inicia a sessão."""
+        logger.info(f"Tentativa de login do usuário: {username}")
+        user_df = self.db.get_docs("users", [("username", "==", username)])
+        if not user_df.empty:
+            user_data = user_df.iloc[0]
+            if user_data['status'] == 'pending':
+                logger.warning(f"Login falhou para {username}: Conta pendente de aprovação.")
+                st.warning("Sua conta está aguardando aprovação.")
+            elif self._check_password(user_data['password'], user_data['salt'], password):
+                st.session_state.logged_in = True
+                st.session_state.username = user_data['username']
+                st.session_state.role = user_data['role']
+                st.session_state.last_activity = time.time()
+                logger.info(f"Usuário {username} logado com sucesso com o papel: {user_data['role']}")
+                st.rerun()
+            else:
+                logger.error(f"Login falhou para {username}: Senha incorreta.")
+                st.error("Usuário ou senha incorretos.")
+        else:
+            logger.error(f"Login falhou: Usuário {username} não encontrado.")
+            st.error("Usuário ou senha incorretos.")
+
+    def check_session_timeout(self):
+        """Verifica se a sessão expirou por inatividade e força o logout."""
+        if 'last_activity' in st.session_state:
+            timeout_seconds = self.SESSION_TIMEOUT_MINUTES * 60
+            if time.time() - st.session_state.last_activity > timeout_seconds:
+                logger.warning(
+                    f"Sessão expirada por inatividade para o usuário: {st.session_state.get('username', 'desconhecido')}")
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.warning("Sessão expirada por inatividade. Por favor, faça login novamente.")
+                time.sleep(3)
+                st.rerun()
+        st.session_state.last_activity = time.time()
+
+    def change_password(self, username, old_password, new_password):
+        """Permite que um usuário altere sua própria senha."""
+        logger.info(f"Tentativa de alteração de senha para o usuário: {username}")
+        user_df = self.db.get_docs("users", [("username", "==", username)])
+        if user_df.empty:
+            st.error("Usuário não encontrado.")
+            return False
+
+        user_data = user_df.iloc[0]
+        if not self._check_password(user_data['password'], user_data['salt'], old_password):
+            st.error("A senha antiga está incorreta.")
+            return False
+
+        if not self._validate_password_strength(new_password):
+            st.error("A nova senha não é forte o suficiente.")
+            return False
+
+        hashed_pw, salt = self._hash_password(new_password)
+        update_data = {"password": hashed_pw, "salt": salt}
+        if self.db.update_doc("users", user_data['id'], update_data, username):
+            logger.info(f"Senha alterada com sucesso para o usuário: {username}")
+            st.success("Senha alterada com sucesso!")
+            return True
         return False
 
-# --- SUPABASE STORAGE CLIENT ---
-def get_supabase_client():
-    """Retorna um cliente do Supabase para Storage."""
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+    def reset_password_by_admin(self, user_id, new_password):
+        """Permite que um administrador redefina a senha de um usuário."""
+        logger.info(f"Admin redefinindo a senha para o usuário ID: {user_id}")
+        if not self._validate_password_strength(new_password):
+            st.error("A nova senha não é forte o suficiente.")
+            return False
 
-def upload_file_to_supabase(file_obj, file_name):
-    """
-    Faz upload de um arquivo para o bucket 'uploads' no Supabase.
-    Retorna a URL pública do arquivo ou None em caso de erro.
-    """
-    try:
-        client = get_supabase_client()
-        file_bytes = file_obj.read()
-        bucket_name = "uploads"
-        path = f"{int(time.time())}_{file_name}"
-        client.storage.from_(bucket_name).upload(path, file_bytes)
-        public_url = client.storage.from_(bucket_name).get_public_url(path)
-        return public_url
-    except Exception as e:
-        st.error(f"Erro ao fazer upload para Supabase Storage: {e}")
-        return None
+        hashed_pw, salt = self._hash_password(new_password)
+        update_data = {"password": hashed_pw, "salt": salt}
+        if self.db.update_doc("users", user_id, update_data, st.session_state.username):
+            logger.info(f"Senha redefinida com sucesso para o usuário ID: {user_id}")
+            return True
+        return False
 
-# --- FUNÇÕES AUXILIARES ---
-def format_currency(value):
-    if isinstance(value, (int, float)):
-        return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return value
 
-def safe_strptime(date_string, fmt):
-    try:
-        return datetime.strptime(date_string, fmt)
-    except (ValueError, TypeError):
-        return None
+# -----------------------------------------------------------------------------
+# 3. UI / VIEWS (LÓGICA DE APRESENTAÇÃO)
+# -----------------------------------------------------------------------------
 
-def to_excel(df, title="Relatório"):
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 12)
+        self.cell(0, 10, 'Relatório de Compras', 0, 1, 'C')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
+        self.cell(0, 10, f'Emitido em: {datetime.now().strftime("%d/%m/%Y %H:%M")}', 0, 0, 'R')
+
+
+def generate_summary_pdf(df: pd.DataFrame, title: str, filters: Dict[str, str]) -> bytes:
+    """Gera um PDF de resumo com uma tabela de dados filtrados."""
+    pdf = PDF()
+    pdf.add_page(orientation='L')  # Paisagem para mais espaço
+
+    # Título
+    pdf.set_font('Arial', 'B', 16)
+    pdf.cell(0, 10, f"Relatório de {title}", 0, 1, 'C')
+    pdf.ln(5)
+
+    # Filtros aplicados
+    pdf.set_font('Arial', 'I', 9)
+    for key, value in filters.items():
+        pdf.cell(0, 5, f"{key}: {value}", 0, 1, 'L')
+    pdf.ln(10)
+
+    # Cabeçalho da Tabela
+    pdf.set_font('Arial', 'B', 8)
+    pdf.set_fill_color(220, 220, 220)
+
+    # Definir colunas relevantes e larguras
+    if title == "Demandas":
+        cols = ['created_at', 'solicitante_demanda', 'categoria', 'descricao_necessidade', 'status_demanda']
+        widths = [25, 30, 40, 125, 30]
+    elif title == "Requisições":
+        cols = ['created_at', 'solicitante', 'numero_rc', 'valor', 'status']
+        widths = [30, 40, 40, 30, 30]
+    else:  # Pedidos
+        cols = ['created_at', 'solicitante', 'numero_pedido', 'valor', 'status', 'data_entrega', 'observacao']
+        widths = [25, 30, 30, 25, 25, 25, 90]
+
+    df_report = df[cols]
+
+    for i, header in enumerate(df_report.columns):
+        pdf.cell(widths[i], 7, str(header).replace('_', ' ').title(), 1, 0, 'C', 1)
+    pdf.ln()
+
+    # Dados da Tabela
+    pdf.set_font('Arial', '', 8)
+    for _, row in df_report.iterrows():
+        max_height = 6
+        for i, col in enumerate(df_report.columns):
+            text = str(row[col]) if pd.notna(row[col]) else ""
+            if isinstance(row[col], datetime) or isinstance(row[col], pd.Timestamp):
+                text = pd.to_datetime(row[col]).strftime('%d/%m/%Y')
+            elif col == 'valor':
+                text = f"R$ {row[col]:,.2f}"
+
+            # Codifica para evitar erros com caracteres especiais
+            encoded_text = text.encode('latin-1', 'replace').decode('latin-1')
+            pdf.cell(widths[i], max_height, encoded_text, 1, 0, 'L')
+        pdf.ln()
+
+    return pdf.output(dest='S')
+
+
+def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
+    """Converte um DataFrame para um arquivo Excel formatado em memória."""
     output = io.BytesIO()
+    df_copy = df.copy()
+
+    # Remove informações de fuso horário para compatibilidade com o openpyxl
+    for col in df_copy.select_dtypes(include=['datetimetz']).columns:
+        df_copy[col] = df_copy[col].dt.tz_localize(None)
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name=title)
+        df_copy.to_excel(writer, index=False, sheet_name=title)
         workbook = writer.book
         worksheet = writer.sheets[title]
+
+        # Estilos para o cabeçalho e células
         header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
-        border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                        top=Side(style='thin'), bottom=Side(style='thin'))
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'),
+                        bottom=Side(style='thin'))
         alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-        for col in range(1, len(df.columns) + 1):
-            cell = worksheet.cell(row=1, column=col)
+        # Formatar cabeçalho
+        for col_num, col_name in enumerate(df_copy.columns, 1):
+            cell = worksheet.cell(row=1, column=col_num)
             cell.fill = header_fill
             cell.font = header_font
             cell.border = border
             cell.alignment = alignment
-            column_letter = get_column_letter(col)
-            column_len = max(df.iloc[:, col-1].astype(str).map(len).max(), len(df.columns[col-1])) + 2
-            worksheet.column_dimensions[column_letter].width = min(column_len, 30)
+            # Ajustar largura das colunas
+            column_letter = get_column_letter(col_num)
+            max_len = max(df_copy[col_name].astype(str).map(len).max(), len(col_name)) + 2
+            worksheet.column_dimensions[column_letter].width = min(max_len, 50)
 
-        for row in range(2, len(df) + 2):
-            for col in range(1, len(df.columns) + 1):
+        # Formatar células de dados
+        for row in range(2, len(df_copy) + 2):
+            for col in range(1, len(df_copy.columns) + 1):
                 cell = worksheet.cell(row=row, column=col)
                 cell.border = border
                 cell.alignment = Alignment(horizontal='left', vertical='center')
-                if 'valor' in df.columns[col-1].lower() or 'total' in df.columns[col-1].lower():
+                # Formatar colunas de valor como moeda
+                if 'valor' in df_copy.columns[col - 1].lower():
                     cell.number_format = 'R$ #,##0.00'
+
+        # Formatação condicional para status
+        status_col_name = next((col for col in ['status', 'status_demanda'] if col in df_copy.columns), None)
+        if status_col_name:
+            green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+            blue_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+
+            status_col_index = df_copy.columns.get_loc(status_col_name) + 1
+            for row in range(2, len(df_copy) + 2):
+                cell = worksheet.cell(row=row, column=status_col_index)
+                if cell.value in ['Finalizado', 'Entregue', 'Fechada']:
+                    cell.fill = green_fill
+                elif cell.value in ['Cancelado', 'Rejeitado']:
+                    cell.fill = red_fill
+                elif cell.value in ['Em Processamento', 'Em Atendimento', 'Em Transporte', 'Pedido Gerado']:
+                    cell.fill = yellow_fill
+                elif cell.value in ['Aberto', 'Aberta']:
+                    cell.fill = blue_fill
 
         worksheet.freeze_panes = 'A2'
         worksheet.auto_filter.ref = worksheet.dimensions
     return output.getvalue()
 
-# --- FUNÇÕES DE AUTENTICAÇÃO ---
-def hash_password(password, salt=None):
-    if salt is None:
-        salt = os.urandom(16)
-    hashed_password = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
-    return hashed_password, salt
 
-def check_password(stored_password, salt, provided_password):
-    if salt is None:
-        return False
-    return stored_password == hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
+class ViewManager:
+    """Classe para gerenciar a renderização da UI."""
 
-# --- LÓGICA DE LOGIN ---
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.username = ""
-    st.session_state.role = ""
+    def __init__(self, auth_service: AuthService, db_service: FirebaseService):
+        self.auth = auth_service
+        self.db = db_service
+        self._init_session_state()
 
-def login_form():
-    st.title("🔐 Login do Sistema")
-    with st.form("login_form"):
-        username = st.text_input("Usuário")
-        password = st.text_input("Senha", type="password")
-        submitted = st.form_submit_button("Entrar")
-        if submitted:
-            user = fetch_data("SELECT * FROM users WHERE username = :username", {"username": username})
-            if not user.empty:
-                user_data = user.iloc[0]
-                if user_data['salt'] is None:
-                    old_hash = hashlib.sha256(password.encode()).hexdigest()
-                    if user_data['password'] == old_hash:
-                        st.info("Atualizando segurança da conta...")
-                        new_hash, new_salt = hash_password(password)
-                        execute_query(
-                            "UPDATE users SET password = :pw, salt = :s WHERE username = :u",
-                            {"pw": new_hash, "s": new_salt, "u": username}
-                        )
-                        st.session_state.logged_in = True
-                        st.session_state.username = username
-                        st.session_state.role = user_data['role']
-                        st.rerun()
-                    else:
-                        st.error("Usuário ou senha incorretos.")
-                elif user_data['status'] == 'pending':
-                    st.warning("Sua conta está aguardando aprovação de um administrador.")
-                elif check_password(user_data['password'], user_data['salt'], password):
-                    st.session_state.logged_in = True
-                    st.session_state.username = user_data['username']
-                    st.session_state.role = user_data['role']
+    def _init_session_state(self):
+        """Inicializa as variáveis de estado da sessão necessárias."""
+        defaults = {
+            'logged_in': False, 'username': "", 'role': "", 'page': "Login",
+            'confirm_delete': {}, 'edit_id': None, 'confirm_delete_user': {},
+            'reset_password_for_user': {}, 'create_rc_from_demanda_id': None,
+            'view_history_id': None, 'confirm_restore': None
+        }
+        for key, value in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+
+    def run(self):
+        """Executa o fluxo principal da aplicação."""
+        if not st.session_state.logged_in:
+            self.render_login_page()
+        else:
+            self.auth.check_session_timeout()
+            self.render_main_app()
+
+    def render_login_page(self):
+        """Renderiza a página de login ou registro."""
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown(
+                """
+                <div style="text-align: center; margin-bottom: 2rem;">
+                    <span style="font-family: sans-serif; font-size: 4rem; font-weight: 900; color: var(--text-color);">ATIBAIA</span><span style="font-family: sans-serif; font-size: 4rem; font-weight: 900; color: #00AEEF;">💧</span>
+                    <div style="font-family: sans-serif; font-size: 2.5rem; color: #00AEEF; letter-spacing: 0.1rem; margin-top: -1rem;">SANEAMENTO</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            if st.session_state.page == "Login":
+                self._render_login_form()
+                if st.button("Não tem conta? Registre-se"):
+                    st.session_state.page = "Registro";
                     st.rerun()
-                else:
-                    st.error("Usuário ou senha incorretos.")
             else:
-                st.error("Usuário ou senha incorretos.")
+                self._render_registration_form()
+                if st.button("Já tem conta? Faça login"):
+                    st.session_state.page = "Login";
+                    st.rerun()
 
-def registration_form():
-    st.title("📝 Registro de Novo Usuário")
-    with st.form("registration_form"):
-        new_username = st.text_input("Novo Usuário")
-        new_password = st.text_input("Nova Senha", type="password")
-        is_gestor = st.checkbox("Sou um gestor (requer aprovação)")
-        submitted = st.form_submit_button("Registrar")
-        if submitted:
-            if not new_username or not new_password:
-                st.warning("Preencha todos os campos.")
-                return
-            users = fetch_data("SELECT id FROM users")
-            role = "admin" if users.empty else "gestor" if is_gestor else "user"
-            status = "active" if not is_gestor else "pending"
-            hashed_pw, salt = hash_password(new_password)
-            if execute_query(
-                "INSERT INTO users (username, password, salt, role, status) VALUES (:u, :p, :s, :r, :st)",
-                {"u": new_username, "p": hashed_pw, "s": salt, "r": role, "st": status}
-            ):
-                st.success(f"Usuário '{new_username}' registrado como '{role}' (status: {status})")
-                time.sleep(2)
-                st.session_state.page = "Login"
+    def _render_login_form(self):
+        st.title("🔐 Login do Sistema")
+        with st.form("login_form"):
+            username = st.text_input("Nome de Usuário")
+            password = st.text_input("Senha", type="password")
+            if st.form_submit_button("Entrar", type="primary"):
+                self.auth.login_user(username, password)
+
+    def _render_registration_form(self):
+        st.title("📝 Registro de Novo Usuário")
+        with st.form("registration_form"):
+            username = st.text_input("Nome de Usuário")
+            password = st.text_input("Senha", type="password")
+            is_gestor = st.checkbox("Sou um gestor (requer aprovação do admin)")
+            if st.form_submit_button("Registrar", type="primary"):
+                self.auth.register_user(username, password, is_gestor)
+
+    def render_main_app(self):
+        """Renderiza a aplicação principal após o login."""
+        self.render_sidebar()
+        st.title("🚀 Sistema de Controle de Compras")
+
+        # Modais são renderizados primeiro para lidar com o estado
+        self.render_edit_modal()
+        if st.session_state.view_history_id:
+            self.render_history_modal()
+
+        # Navegação principal usando st.tabs
+        tab_dashboard, tab_demandas, tab_rcs, tab_pedidos = st.tabs([
+            "📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"
+        ])
+
+        with tab_dashboard:
+            self.render_dashboard()
+        with tab_demandas:
+            self.render_demandas()
+        with tab_rcs:
+            self.render_requisicoes()
+        with tab_pedidos:
+            self.render_pedidos()
+
+    def render_sidebar(self):
+        with st.sidebar:
+            st.write(f"👤 **{st.session_state.username}** ({st.session_state.role})")
+
+            with st.expander("Meu Perfil"):
+                with st.form("change_password_form", clear_on_submit=True):
+                    st.subheader("Alterar Senha")
+                    old_password = st.text_input("Senha Antiga", type="password")
+                    new_password = st.text_input("Nova Senha", type="password")
+                    confirm_password = st.text_input("Confirmar Nova Senha", type="password")
+                    if st.form_submit_button("Alterar Senha", type="primary"):
+                        if new_password != confirm_password:
+                            st.error("As novas senhas não coincidem.")
+                        else:
+                            with st.spinner("Alterando senha..."):
+                                if self.auth.change_password(st.session_state.username, old_password, new_password):
+                                    time.sleep(2)
+                                    st.rerun()
+
+            if st.button("Logout", use_container_width=True):
+                for key in list(st.session_state.keys()): del st.session_state[key]
+                st.rerun()
+            st.divider()
+            if st.session_state.role == 'admin':
+                self.render_admin_panel()
+
+    def render_admin_panel(self):
+        st.header("⚙️ Administração")
+        with st.expander("Gerenciar Usuários", expanded=True):
+            # Seção para usuários pendentes
+            pending_users = self.db.get_docs("users", [("status", "==", "pending")])
+            if not pending_users.empty:
+                st.subheader("Aprovações Pendentes")
+                st.warning(f"🔔 **{len(pending_users)} aprovações pendentes!**")
+                for _, user in pending_users.iterrows():
+                    c1, c2, c3 = st.columns([2, 1, 1])
+                    c1.write(f"{user['username']} ({user['role']})")
+                    if c2.button("✅", key=f"a_{user['id']}", help="Aprovar"):
+                        with st.spinner("Processando..."):
+                            self.db.update_doc("users", user['id'], {"status": "active"}, st.session_state.username);
+                            st.rerun()
+                    if c3.button("🗑️", key=f"r_{user['id']}", help="Rejeitar"):
+                        with st.spinner("Processando..."):
+                            self.db.delete_doc("users", user['id']);
+                            st.rerun()
+                st.divider()
+
+            # Seção para usuários ativos
+            st.subheader("Usuários Ativos")
+            active_users = self.db.get_docs("users", [("status", "==", "active")])
+            if not active_users.empty:
+                for _, user in active_users.iterrows():
+                    is_current_user = user['username'] == st.session_state.username
+                    c1, c2, c3 = st.columns([3, 1, 1])
+                    c1.write(f"**{user['username']}** ({user['role']}){' (Você)' if is_current_user else ''}")
+
+                    if c2.button("🔑", key=f"reset_pw_{user['id']}", help="Redefinir Senha", disabled=is_current_user):
+                        st.session_state.reset_password_for_user = {'id': user['id'], 'username': user['username']}
+                        st.rerun()
+
+                    if c3.button("🗑️", key=f"del_user_{user['id']}", help="Excluir Usuário", disabled=is_current_user):
+                        st.session_state.confirm_delete_user = {'id': user['id'], 'username': user['username']}
+                        st.rerun()
+
+                    # Formulário para redefinir senha
+                    if st.session_state.get('reset_password_for_user', {}).get('id') == user['id']:
+                        with st.form(key=f"reset_form_{user['id']}", clear_on_submit=True):
+                            st.warning(
+                                f"Redefinindo a senha para **{st.session_state.reset_password_for_user['username']}**.")
+                            new_pass = st.text_input("Nova Senha", type="password")
+                            if st.form_submit_button("Confirmar Redefinição", type="primary"):
+                                with st.spinner("Redefinindo senha..."):
+                                    if self.auth.reset_password_by_admin(user['id'], new_pass):
+                                        st.toast(f"Senha para {user['username']} redefinida.", icon="🔑")
+                                        del st.session_state.reset_password_for_user
+                                        time.sleep(1);
+                                        st.rerun()
+                            if st.form_submit_button("Cancelar"):
+                                del st.session_state.reset_password_for_user
+                                st.rerun()
+
+                    # Modal de confirmação para excluir usuário
+                    if st.session_state.get('confirm_delete_user', {}).get('id') == user['id']:
+                        st.error(
+                            f"Tem certeza que quer excluir o usuário **{st.session_state.confirm_delete_user['username']}**?")
+                        confirm_c1, confirm_c2, _ = st.columns([1, 1, 3])
+                        if confirm_c1.button("Sim, excluir", key=f"confirm_del_user_{user['id']}", type="primary"):
+                            with st.spinner("Excluindo usuário..."):
+                                self.db.delete_doc("users", user['id'])
+                                del st.session_state.confirm_delete_user
+                                st.toast(f"Usuário {user['username']} excluído.", icon="🗑️")
+                                time.sleep(1);
+                                st.rerun()
+                        if confirm_c2.button("Cancelar", key=f"cancel_del_user_{user['id']}"):
+                            del st.session_state.confirm_delete_user
+                            st.rerun()
+            else:
+                st.info("Nenhum usuário ativo encontrado.")
+
+        st.divider()
+        st.subheader("Backup e Restauro Local")
+
+        # Seção de Backup Local
+        backup_data_bytes = self._generate_backup_data()
+        st.download_button(
+            label="📥 Criar e Baixar Backup Local",
+            data=backup_data_bytes,
+            file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True,
+            type="primary"
+        )
+
+        # Seção de Restauro Local
+        st.subheader("Restaurar a partir de Arquivo")
+        uploaded_file = st.file_uploader("Carregue um arquivo de backup (.json)", type="json")
+        if uploaded_file is not None:
+            if st.button("Restaurar a partir deste Arquivo"):
+                st.session_state.confirm_restore = uploaded_file
                 st.rerun()
 
-if not st.session_state.logged_in:
-    if 'page' not in st.session_state:
-        st.session_state.page = "Login"
-    if st.session_state.page == "Login":
-        login_form()
-        if st.button("Não tem conta? Registre-se"):
-            st.session_state.page = "Registro"
+        if st.session_state.get('confirm_restore'):
+            st.error(
+                f"Tem certeza que quer restaurar o backup '{st.session_state.confirm_restore.name}'? Todos os dados atuais serão apagados.")
+            rc1, rc2, _ = st.columns([1, 1, 3])
+            if rc1.button("Sim, restaurar", key=f"confirm_restore_local", type="primary"):
+                with st.spinner("Restaurando backup... Isso pode demorar..."):
+                    backup_data = json.load(st.session_state.confirm_restore)
+                    if self.db.restore_from_backup_data(backup_data):
+                        st.success("Backup restaurado com sucesso!")
+                        del st.session_state.confirm_restore
+                        time.sleep(2);
+                        st.rerun()
+            if rc2.button("Cancelar", key=f"cancel_restore_local"):
+                del st.session_state.confirm_restore
+                st.rerun()
+
+    def _render_paginated_rows(self, df: pd.DataFrame, render_function, key_suffix: str):
+        """Renderiza linhas de um DataFrame com paginação."""
+        if df.empty:
+            st.info("Nenhum dado encontrado.")
+            return
+
+        items_per_page = st.selectbox("Itens por página", [5, 10, 20], key=f"items_{key_suffix}", index=1)
+        total_pages = max(1, (len(df) - 1) // items_per_page + 1)
+        page_key = f"page_{key_suffix}"
+        if page_key not in st.session_state: st.session_state[page_key] = 1
+        st.session_state[page_key] = min(st.session_state[page_key], total_pages)
+
+        c1, c2, c3 = st.columns([1, 2, 1])
+        if c1.button("⬅️", key=f"prev_{key_suffix}", help="Página Anterior",
+                     disabled=(st.session_state[page_key] <= 1)):
+            st.session_state[page_key] -= 1;
             st.rerun()
-    else:
-        registration_form()
-        if st.button("Já tem conta? Faça login"):
-            st.session_state.page = "Login"
+        if c3.button("➡️", key=f"next_{key_suffix}", help="Próxima Página",
+                     disabled=(st.session_state[page_key] >= total_pages)):
+            st.session_state[page_key] += 1;
             st.rerun()
-    st.stop()
+        c2.write(f"Página **{st.session_state[page_key]}** de **{total_pages}**")
 
-# --- APLICAÇÃO PRINCIPAL ---
-st.title("🚀 Sistema de Controle de Compras")
+        start_idx = (st.session_state[page_key] - 1) * items_per_page
+        for _, row in df.iloc[start_idx: start_idx + items_per_page].iterrows():
+            render_function(row)
 
-# Inicializa variáveis de estado
-for key in ['edit_id', 'show_rc_form', 'pedido_edit_id', 'show_pedido_form',
-            'rc_id_para_pedido', 'confirm_reset', 'confirm_delete', 'show_demanda_form',
-            'demanda_edit_id', 'demanda_id_para_rc', 'pedido_to_finalize']:
-    if key not in st.session_state:
-        st.session_state[key] = None
+    def render_dashboard(self):
+        st.header("Dashboard de Métricas")
+        df_demandas = self.db.get_docs("demandas")
+        df_rc = self.db.get_docs("requisicoes")
+        df_pedidos = self.db.get_docs("pedidos")
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.write(f"👤 **{st.session_state.username}** ({st.session_state.role})")
-    if st.button("Logout"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+        total_valor_rc = df_rc['valor'].sum() if not df_rc.empty else 0
 
-    if st.session_state.role == 'admin':
-        st.header("⚙️ Administração")
-        with st.expander("Gerenciar Usuários"):
-            pending = fetch_data("SELECT id, username, role FROM users WHERE status = 'pending'")
-            if not pending.empty:
-                st.subheader("Aprovações Pendentes")
-                for _, user in pending.iterrows():
-                    c1, c2, c3 = st.columns([2,1,1])
-                    with c1: st.write(f"{user['username']} ({user['role']})")
-                    with c2:
-                        if st.button("✅ Aprovar", key=f"a_{user['id']}"):
-                            execute_query("UPDATE users SET status = 'active' WHERE id = :id", {"id": user['id']})
-                            st.rerun()
-                    with c3:
-                        if st.button("🗑️ Rejeitar", key=f"r_{user['id']}"):
-                            execute_query("DELETE FROM users WHERE id = :id", {"id": user['id']})
-                            st.rerun()
-                st.markdown("---")
-            users = fetch_data("SELECT id, username, role FROM users WHERE status = 'active'")
-            st.dataframe(users, hide_index=True, use_container_width=True)
-            selected_user = st.selectbox("Gerenciar usuário", options=users['username'].tolist() if not users.empty else [])
-            if selected_user and not users.empty:
-                with st.form("reset_pass"):
-                    new_pass = st.text_input("Nova senha", type="password")
-                    if st.form_submit_button("Alterar senha"):
-                        if new_pass:
-                            hp, sl = hash_password(new_pass)
-                            execute_query("UPDATE users SET password = :p, salt = :s WHERE username = :u", {"p": hp, "s": sl, "u": selected_user})
-                            st.toast("Senha alterada.")
-                with st.form("change_role"):
-                    current_role = users[users['username'] == selected_user]['role'].iloc[0]
-                    new_role = st.selectbox("Novo papel", ["user", "gestor", "admin"], index=["user", "gestor", "admin"].index(current_role))
-                    if st.form_submit_button("Mudar papel"):
-                        num_admins = fetch_data("SELECT COUNT(*) as c FROM users WHERE role = 'admin' AND status = 'active'").iloc[0]['c']
-                        if current_role == 'admin' and num_admins <= 1 and new_role != 'admin':
-                            st.error("Precisa de pelo menos 1 admin.")
-                        else:
-                            execute_query("UPDATE users SET role = :r WHERE username = :u", {"r": new_role, "u": selected_user})
-                            st.toast("Papel alterado.")
-                            if selected_user == st.session_state.username:
-                                time.sleep(1)
-                                for key in st.session_state.keys(): del st.session_state[key]
-                                st.rerun()
-                if selected_user != st.session_state.username:
-                    if st.button("Excluir", type="secondary"):
-                        execute_query("DELETE FROM users WHERE username = :u", {"u": selected_user})
-                        st.rerun()
-                else:
-                    st.info("Não pode excluir a si mesmo.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
+        c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
+        c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
+        c4.metric("Valor Total em RCs", f"R$ {total_valor_rc:,.2f}")
+        st.divider()
 
-        with st.expander("⚠️ Zerar Dados"):
-            if st.button("Zerar Dados"):
-                st.session_state.confirm_reset = True
-            if st.session_state.confirm_reset:
-                st.warning("Tem certeza?")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("Sim", type="primary"):
-                        execute_query("DELETE FROM pedidos")
-                        execute_query("DELETE FROM requisicoes")
-                        execute_query("DELETE FROM demandas")
-                        st.toast("Dados zerados!")
-                        st.session_state.confirm_reset = False
-                        st.rerun()
-                with c2:
-                    if st.button("Cancelar"):
-                        st.session_state.confirm_reset = False
-                        st.rerun()
-
-# --- ABAS PRINCIPAIS ---
-tab_dashboard, tab_demandas, tab_rcs, tab_pedidos_andamento, tab_pedidos_finalizados = st.tabs([
-    "📊 Dashboard", "📝 Demandas", "🛒 RCs", "🚚 Pedidos", "✅ Finalizados"
-])
-
-# --- DASHBOARD ---
-with tab_dashboard:
-    st.header("Dashboard de Métricas")
-    with st.expander("Filtros do Dashboard"):
-        solicitantes_dash = fetch_data("SELECT DISTINCT solicitante_demanda FROM demandas")
-        solicitante_list_dash = solicitantes_dash['solicitante_demanda'].tolist()
-        filtro_solicitante_dash = st.multiselect("Filtrar por Solicitante da Demanda", options=solicitante_list_dash)
-
-    where_clause_demanda = ""
-    params_demanda_dash = {}
-    if filtro_solicitante_dash:
-        where_clause_demanda = f"AND d.solicitante_demanda = ANY(ARRAY[:solicitante]::text[])"
-        params_demanda_dash = {"solicitante": filtro_solicitante_dash}
-
-    query_total_gasto = f"""
-        SELECT COALESCE(SUM(r.valor), 0) as total 
-        FROM requisicoes r 
-        JOIN demandas d ON r.demanda_id = d.id 
-        WHERE r.status = 'Finalizado' {where_clause_demanda if filtro_solicitante_dash else ''}
-    """
-    total_rcs_finalizadas = fetch_data(query_total_gasto, params_demanda_dash).iloc[0]['total']
-
-    demandas_abertas = fetch_data(f"SELECT COUNT(id) as count FROM demandas WHERE status_demanda = 'Aberta' {where_clause_demanda.replace('d.solicitante_demanda', 'solicitante_demanda') if filtro_solicitante_dash else ''}", params_demanda_dash).iloc[0]['count']
-
-    query_rcs_abertas = f"""
-        SELECT COUNT(r.id) as count 
-        FROM requisicoes r 
-        JOIN demandas d ON r.demanda_id = d.id 
-        WHERE r.status = 'Aberto' {where_clause_demanda if filtro_solicitante_dash else ''}
-    """
-    rcs_abertas = fetch_data(query_rcs_abertas, params_demanda_dash).iloc[0]['count']
-
-    query_pedidos_andamento = f"""
-        SELECT COUNT(p.id) as count 
-        FROM pedidos p 
-        JOIN requisicoes r ON p.rc_id = r.id 
-        JOIN demandas d ON r.demanda_id = d.id 
-        WHERE p.status_pedido NOT IN ('Entregue', 'Cancelado') {where_clause_demanda if filtro_solicitante_dash else ''}
-    """
-    pedidos_andamento = fetch_data(query_pedidos_andamento, params_demanda_dash).iloc[0]['count']
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(label="Total Gasto (RCs Finalizadas)", value=format_currency(total_rcs_finalizadas))
-    with col2:
-        st.metric(label="Demandas Abertas", value=demandas_abertas)
-    with col3:
-        st.metric(label="RCs Abertas", value=rcs_abertas)
-    with col4:
-        st.metric(label="Pedidos em Andamento", value=pedidos_andamento)
-
-# --- DEMANDAS ---
-with tab_demandas:
-    st.header("Demandas de Compras")
-    with st.expander("➕ Adicionar Nova Demanda"):
-        with st.form("demanda_form", clear_on_submit=True):
-            descricao_necessidade = st.text_area("O que precisa comprar ou contratar? (Material ou Serviço)")
-            uploaded_file = st.file_uploader("Anexar arquivo (imagem, PDF, Doc)", type=["png", "jpg", "jpeg", "pdf", "doc", "docx"])
-            submitted = st.form_submit_button("Registrar Demanda")
-            if submitted:
-                if not descricao_necessidade:
-                    st.warning("A descrição é obrigatória.")
-                else:
-                    anexo_url = None
-                    if uploaded_file is not None:
-                        anexo_url = upload_file_to_supabase(uploaded_file, uploaded_file.name)
-                        if not anexo_url:
-                            st.error("Falha ao fazer upload do arquivo. Demanda não foi salva.")
-                            continue
-
-                    params = (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), st.session_state.username, descricao_necessidade, anexo_url, 'Aberta')
-                    if execute_query(
-                        "INSERT INTO demandas (data_demanda, solicitante_demanda, descricao_necessidade, anexo_path, status_demanda) VALUES (:data, :solicitante, :descricao, :anexo, :status)",
-                        {"data": params[0], "solicitante": params[1], "descricao": params[2], "anexo": anexo_url, "status": params[4]}
-                    ):
-                        st.toast("Nova demanda registrada com sucesso!")
-                        st.rerun()
-
-    with st.expander("🔍 Filtros e Busca"):
-        filtro_busca_demanda = st.text_input("Buscar na descrição da demanda")
-        solicitantes = fetch_data("SELECT DISTINCT solicitante_demanda FROM demandas")
-        solicitante_list = solicitantes['solicitante_demanda'].tolist()
-        filtro_solicitante = st.multiselect("Filtrar por Solicitante", options=solicitante_list)
-
-    query_demanda = "SELECT * FROM demandas WHERE 1=1"
-    params_demanda = {}
-    if filtro_busca_demanda:
-        query_demanda += " AND descricao_necessidade ILIKE :busca"
-        params_demanda["busca"] = f"%{filtro_busca_demanda}%"
-    if filtro_solicitante:
-        query_demanda += " AND solicitante_demanda = ANY(ARRAY[:solicitante]::text[])"
-        params_demanda["solicitante"] = filtro_solicitante
-    query_demanda += " ORDER BY id DESC"
-
-    df_demandas = fetch_data(query_demanda, params_demanda)
-    st.header("Lista de Demandas")
-    if df_demandas.empty:
-        st.info("Nenhuma demanda encontrada.")
-    else:
-        for index, row in df_demandas.iterrows():
-            st.markdown("---")
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                status_demanda = row.get('status_demanda', 'Status Indefinido')
-                status_emoji = "🔵" if status_demanda == "Aberta" else "🟢" if status_demanda == "Em atendimento" else "🔴"
-                st.subheader(f"Demanda Nº {row['id']} - Status: {status_emoji} {status_demanda}")
-                st.write(f"**Solicitante:** {row['solicitante_demanda']}")
-                st.write(f"**Data:** {safe_strptime(row['data_demanda'], '%Y-%m-%d %H:%M:%S').strftime('%d/%m/%Y') if safe_strptime(row['data_demanda'], '%Y-%m-%d %H:%M:%S') else 'Data inválida'}")
-                st.info(f"**Necessidade:** {row['descricao_necessidade']}")
-            with col2:
-                anexo_url = row['anexo_path']
-                if anexo_url:
-                    file_name = anexo_url.split("/")[-1]
-                    file_extension = os.path.splitext(file_name)[1].lower()
-                    if file_extension in ['.png', '.jpg', '.jpeg', '.gif']:
-                        try:
-                            st.image(anexo_url, caption="Anexo", use_container_width=True)
-                        except Exception:
-                            st.warning("Imagem não carregada.")
-                    else:
-                        st.markdown(f"[📎 Baixar Anexo: {file_name}]({anexo_url})", unsafe_allow_html=True)
-
-            c1, c2, c3 = st.columns([1,1,3])
-            with c1:
-                if row['solicitante_demanda'] == st.session_state.username or st.session_state.role in ['admin', 'gestor']:
-                    if st.button("✏️ Editar", key=f"edit_demanda_{row['id']}"):
-                        st.session_state.demanda_edit_id = row['id']
-                        st.session_state.show_demanda_form = True
-                        st.rerun()
-            with c2:
-                if row['solicitante_demanda'] == st.session_state.username or st.session_state.role == 'admin':
-                    if st.button("🗑️ Excluir", key=f"del_demanda_{row['id']}", type="secondary"):
-                        st.session_state.confirm_delete['demanda'] = row['id']
-                        st.rerun()
-            if st.session_state.confirm_delete.get('demanda') == row['id']:
-                st.warning(f"Tem certeza que deseja excluir a Demanda Nº {row['id']}?")
-                del_c1, del_c2 = st.columns(2)
-                with del_c1:
-                    if st.button("Sim, excluir demanda", key=f"confirm_del_demanda_{row['id']}", use_container_width=True):
-                        if execute_query("DELETE FROM demandas WHERE id = :id", {"id": row['id']}):
-                            st.toast("Demanda excluída.", icon="🗑️")
-                            st.session_state.confirm_delete = {}
-                            st.rerun()
-                with del_c2:
-                    if st.button("Cancelar", key=f"cancel_del_demanda_{row['id']}", use_container_width=True):
-                        st.session_state.confirm_delete = {}
-                        st.rerun()
-            with c3:
-                status_demanda = row.get('status_demanda', 'Aberta')
-                if status_demanda == 'Aberta' and st.session_state.role != 'gestor':
-                    if st.button("🛒 Criar RC", key=f"create_rc_{row['id']}", type="primary"):
-                        st.session_state.demanda_id_para_rc = row['id']
-                        st.session_state.show_rc_form = True
-                        st.rerun()
-                elif status_demanda == 'Em atendimento':
-                    st.success("✔️ Demanda em atendimento (RC criada).")
-                elif status_demanda == 'Finalizada':
-                    st.error("✔️ Demanda Finalizada (Pedido Entregue).")
-
-# --- RCs ---
-with tab_rcs:
-    st.header("Requisições de Compra (RCs)")
-    if st.session_state.role != 'gestor':
-        if st.button("➕ Adicionar Nova RC", key="add_rc"):
-            st.session_state.show_rc_form = True
-            st.session_state.edit_id = None
-            st.session_state.demanda_id_para_rc = None
-            st.rerun()
-
-    with st.expander("Filtros e Relatórios de RCs"):
-        filtro_status_rc = st.multiselect("Filtrar por Status da RC", options=["Aberto", "Finalizado", "Cancelado"])
         c1, c2 = st.columns(2)
         with c1:
-            filtro_data_inicio_rc = st.date_input("Data de Início da RC", value=None)
+            st.subheader("Status das Demandas")
+            if not df_demandas.empty:
+                status_counts = df_demandas['status_demanda'].value_counts().reset_index()
+                fig = px.bar(status_counts, x='status_demanda', y='count', title="Distribuição de Status",
+                             text_auto=True, color='status_demanda',
+                             labels={'status_demanda': 'Status', 'count': 'Quantidade'})
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Nenhuma demanda para exibir.")
         with c2:
-            filtro_data_fim_rc = st.date_input("Data de Fim da RC", value=None)
+            st.subheader("Demandas por Categoria")
+            if not df_demandas.empty:
+                cat_counts = df_demandas['categoria'].value_counts().reset_index()
+                fig = px.pie(cat_counts, names='categoria', values='count', title="Distribuição por Categoria", hole=.3,
+                             labels={'categoria': 'Categoria', 'count': 'Quantidade'})
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Nenhuma categoria para exibir.")
 
-    query_rc = "SELECT * FROM requisicoes WHERE 1=1"
-    params_rc = {}
-    if filtro_status_rc:
-        query_rc += " AND status = ANY(ARRAY[:status]::text[])"
-        params_rc["status"] = filtro_status_rc
-    if filtro_data_inicio_rc:
-        query_rc += " AND data_criacao >= :data_inicio"
-        params_rc["data_inicio"] = str(filtro_data_inicio_rc)
-    if filtro_data_fim_rc:
-        query_rc += " AND data_criacao <= :data_fim"
-        params_rc["data_fim"] = str(filtro_data_fim_rc)
-    query_rc += " ORDER BY id DESC"
+    def render_demandas(self):
+        st.header("Demandas de Compras")
 
-    df_rc = fetch_data(query_rc, params_rc)
-    if not df_rc.empty:
-        st.download_button(
-            label="📥 Exportar RCs para Excel",
-            data=to_excel(df_rc, "Relatório de RCs"),
-            file_name='relatorio_rcs.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        )
-
-    st.header("Lista de Requisições")
-    if df_rc.empty:
-        st.info("Nenhuma RC encontrada com os filtros aplicados.")
-    else:
-        df_display_rc = df_rc.copy()
-        df_display_rc['valor'] = df_display_rc['valor'].apply(format_currency)
-        df_display_rc['data_criacao'] = pd.to_datetime(df_display_rc['data_criacao']).dt.strftime('%d/%m/%Y')
-        st.dataframe(df_display_rc, use_container_width=True, hide_index=True)
-
-        if st.session_state.role != 'gestor':
-            st.subheader("Operações com a RC Selecionada")
-            rc_ids = df_rc['id'].tolist()
-            selected_id_rc = st.selectbox("Selecione uma RC", options=rc_ids, format_func=lambda x: f"RC Nº {x}", key="select_rc")
-            if selected_id_rc:
-                col_edit, col_delete, col_gerar_pedido, col_space = st.columns([1.5, 1.5, 2, 5])
-                with col_edit:
-                    if st.button("✏️ Editar RC", use_container_width=True):
-                        st.session_state.edit_id = selected_id_rc
-                        st.session_state.show_rc_form = True
-                        st.rerun()
-                with col_delete:
-                    if st.button("🗑️ Excluir RC", use_container_width=True, type="secondary"):
-                        st.session_state.confirm_delete['rc'] = selected_id_rc
-                        st.rerun()
-                if st.session_state.confirm_delete.get('rc') == selected_id_rc:
-                    pedidos_associados = fetch_data("SELECT id FROM pedidos WHERE rc_id = :rc_id", {"rc_id": selected_id_rc})
-                    if not pedidos_associados.empty:
-                        st.error(f"Não é possível excluir a RC Nº {selected_id_rc}, pois ela possui pedidos associados.")
-                        if st.button("Ok, entendi", key=f"ack_del_rc_{selected_id_rc}"):
-                            st.session_state.confirm_delete = {}
-                            st.rerun()
-                    else:
-                        st.warning(f"Tem certeza que deseja excluir a RC Nº {selected_id_rc}?")
-                        del_c1, del_c2 = st.columns(2)
-                        with del_c1:
-                            if st.button("Sim, excluir RC", key=f"confirm_del_rc_{selected_id_rc}", use_container_width=True):
-                                if execute_query("DELETE FROM requisicoes WHERE id = :id", {"id": selected_id_rc}):
-                                    st.toast(f"RC Nº {selected_id_rc} excluída!", icon="🗑️")
-                                    st.session_state.confirm_delete = {}
+        # Restrição de Acesso: Apenas admin, user e gestor podem criar/editar demandas
+        if st.session_state.role in ['admin', 'user', 'gestor']:
+            with st.expander("➕ Adicionar Nova Demanda"):
+                with st.form("demanda_form", clear_on_submit=True):
+                    descricao = st.text_area("Descrição da Necessidade")
+                    categoria = st.text_input("Categoria")
+                    uploaded_file = st.file_uploader("Anexo (Opcional)")
+                    if st.form_submit_button("Registrar Demanda", type="primary"):
+                        with st.spinner("Registrando demanda..."):
+                            try:
+                                demanda = Demanda(solicitante_demanda=st.session_state.username,
+                                                  descricao_necessidade=descricao, categoria=categoria)
+                                anexo_url = self.db.upload_file(uploaded_file,
+                                                                uploaded_file.name) if uploaded_file else None
+                                demanda_data = demanda.dict()
+                                demanda_data['historico'] = [
+                                    f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                                demanda_data['anexo_path'] = anexo_url
+                                if self.db.add_doc("demandas", demanda_data):
+                                    st.toast("✅ Demanda registrada!", icon="✅");
+                                    time.sleep(1);
                                     st.rerun()
-                        with del_c2:
-                            if st.button("Cancelar", key=f"cancel_del_rc_{selected_id_rc}", use_container_width=True):
-                                st.session_state.confirm_delete = {}
+                            except Exception as e:
+                                st.error(f"Erro de validação: {e}")
+
+        st.header("Demandas Registradas")
+        df_demandas = self.db.get_docs("demandas")
+        self._render_paginated_rows(df_demandas, lambda row: self.render_data_row("demandas", row), "demandas")
+
+    def render_requisicoes(self):
+        st.header("Requisições de Compra (RCs)")
+
+        # Restrição de Acesso: Apenas admin e user podem criar RCs
+        if st.session_state.role in ['admin', 'user']:
+            with st.expander("➕ Adicionar Nova Requisição"):
+                st.subheader("Passo 1: Selecione a Demanda")
+                df_demandas_abertas = self.db.get_docs("demandas", [("status_demanda", "==", "Aberta")])
+                demanda_options = {"Selecione uma Demanda": None}
+                if not df_demandas_abertas.empty:
+                    for _, row in df_demandas_abertas.iterrows():
+                        demanda_options[f"ID: ...{row['id'][-6:]} - {row['descricao_necessidade'][:40]}..."] = row['id']
+
+                selected_demanda_display = st.selectbox(
+                    "Vincular à Demanda (apenas abertas)",
+                    list(demanda_options.keys()),
+                    label_visibility="collapsed"
+                )
+                selected_demanda_id = demanda_options.get(selected_demanda_display)
+
+                if selected_demanda_id:
+                    selected_demanda_details = \
+                    df_demandas_abertas[df_demandas_abertas['id'] == selected_demanda_id].iloc[0]
+                    with st.container(border=True):
+                        st.markdown(f"**Descrição Completa:** {selected_demanda_details['descricao_necessidade']}")
+                        st.markdown(
+                            f"**Categoria:** {selected_demanda_details['categoria']} | **Solicitante:** {selected_demanda_details['solicitante_demanda']}")
+
+                    st.subheader("Passo 2: Detalhes da Requisição")
+                    with st.form("requisicao_form_details", clear_on_submit=True):
+                        valor = st.number_input("Valor da Requisição (R$)", min_value=0.01, format="%.2f")
+                        numero_rc = st.text_input("Número da RC (opcional)")
+
+                        if st.form_submit_button("Registrar Requisição", type="primary"):
+                            with st.spinner("Registrando requisição..."):
+                                try:
+                                    requisicao = Requisicao(solicitante=st.session_state.username,
+                                                            demanda_id=selected_demanda_id, valor=valor,
+                                                            numero_rc=numero_rc or None)
+                                    req_data = requisicao.dict()
+                                    req_data['historico'] = [
+                                        f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                                    if self.db.add_doc("requisicoes", req_data):
+                                        self.db.update_doc("demandas", selected_demanda_id,
+                                                           {"status_demanda": "Em Atendimento"},
+                                                           st.session_state.username)
+                                        st.toast("✅ Requisição registrada!", icon="✅");
+                                        time.sleep(1);
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro ao registrar: {e}")
+                else:
+                    st.info("Selecione uma demanda da lista acima para continuar.")
+
+        st.header("Requisições Registradas")
+        df_rc = self.db.get_docs("requisicoes")
+        if not df_rc.empty:
+            st.download_button("📥 Exportar para Excel", to_excel(df_rc, "Relatório de RCs"), 'relatorio_rcs.xlsx')
+        self._render_paginated_rows(df_rc, lambda row: self.render_data_row("requisicoes", row), "rcs")
+
+    def render_pedidos(self):
+        st.header("Pedidos de Compra")
+        all_pedidos = self.db.get_docs("pedidos")
+
+        tab_andamento, tab_entregues, tab_cancelados = st.tabs(["⏳ Em Andamento", "✅ Entregues", "❌ Cancelados"])
+
+        with tab_andamento:
+            df_filtered = all_pedidos[all_pedidos['status'].isin(
+                ['Em Processamento', 'Em Transporte'])] if not all_pedidos.empty else pd.DataFrame()
+            if not df_filtered.empty:
+                st.download_button("📥 Exportar", to_excel(df_filtered, "Pedidos em Andamento"),
+                                   'pedidos_andamento.xlsx', key='btn_andamento')
+            self._render_paginated_rows(df_filtered, lambda row: self.render_data_row("pedidos", row),
+                                        "pedidos_andamento")
+
+        with tab_entregues:
+            df_filtered = all_pedidos[all_pedidos['status'] == 'Entregue'] if not all_pedidos.empty else pd.DataFrame()
+            if not df_filtered.empty:
+                st.download_button("📥 Exportar", to_excel(df_filtered, "Pedidos Entregues"), 'pedidos_entregues.xlsx',
+                                   key='btn_entregues')
+            self._render_paginated_rows(df_filtered, lambda row: self.render_data_row("pedidos", row),
+                                        "pedidos_entregues")
+
+        with tab_cancelados:
+            df_filtered = all_pedidos[all_pedidos['status'] == 'Cancelado'] if not all_pedidos.empty else pd.DataFrame()
+            if not df_filtered.empty:
+                st.download_button("📥 Exportar", to_excel(df_filtered, "Pedidos Cancelados"), 'pedidos_cancelados.xlsx',
+                                   key='btn_cancelados')
+            self._render_paginated_rows(df_filtered, lambda row: self.render_data_row("pedidos", row),
+                                        "pedidos_cancelados")
+
+    def render_data_row(self, collection: str, row: pd.Series):
+        """Renderiza uma linha de dados com botões de ação."""
+        key = f"{collection}_{row['id']}"
+        role = st.session_state.role
+
+        with st.container(border=True):
+            # Define o título e status com base na coleção
+            if collection == 'demandas':
+                title = f"Demanda: {row.get('descricao_necessidade', row['id'])} (Cat: {row.get('categoria', 'N/A')})"
+                status = row.get('status_demanda', 'N/A')
+            elif collection == 'requisicoes':
+                title = f"RC: {row.get('numero_rc', 'S/N')} | Valor: R$ {row.get('valor', 0):,.2f}"
+                status = row.get('status', 'N/A')
+            else:  # Pedidos
+                title = f"Pedido: {row.get('numero_pedido', 'S/N')} | Valor: R$ {row.get('valor', 0):,.2f}"
+                status = row.get('status', 'N/A')
+
+            st.markdown(f"**{title}**")
+            st.markdown(
+                f"**Status:** `{status}` | **Criado por:** `{row.get('solicitante', row.get('solicitante_demanda', 'N/A'))}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
+
+            # Exibe campos adicionais para Pedidos
+            if collection == 'pedidos':
+                if pd.notna(row.get('data_entrega')):
+                    st.markdown(
+                        f"**Data de Entrega:** `{pd.to_datetime(row.get('data_entrega')).strftime('%d/%m/%Y')}`")
+                if row.get('observacao'):
+                    st.markdown(f"**Observação:** *{row.get('observacao')}*")
+
+            # Botões de ação com base na role
+            cols = st.columns([1, 1, 1, 2, 5])
+
+            # Botão Editar
+            can_edit = (role == 'admin') or \
+                       (role == 'user') or \
+                       (role == 'gestor' and collection == 'demandas')
+            if can_edit:
+                if cols[0].button("✏️", key=f"edit_{key}", help="Editar"):
+                    st.session_state.edit_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()};
+                    st.rerun()
+
+            # Botão Excluir (Apenas Admin)
+            if role == 'admin':
+                if cols[1].button("🗑️", key=f"del_{key}", help="Excluir"):
+                    st.session_state.confirm_delete = {'collection': collection, 'id': row['id'], 'desc': title};
+                    st.rerun()
+
+            # Botão Histórico (Todos)
+            if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"):
+                st.session_state.view_history_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()};
+                st.rerun()
+
+            # Botão Gerar Pedido (Apenas Admin e User)
+            if collection == "requisicoes" and status == "Aberto" and role in ['admin', 'user']:
+                if cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary",
+                                  help="Gerar Pedido de Compra"):
+                    with st.spinner("Gerando pedido..."):
+                        try:
+                            pedido = Pedido(requisicao_id=row['id'], solicitante=row['solicitante'], valor=row['valor'],
+                                            numero_pedido=f"PED-{row.get('numero_rc', row['id'][-4:])}")
+                            pedido_data = pedido.dict()
+                            pedido_data['historico'] = [
+                                f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                            if self.db.add_doc("pedidos", pedido_data):
+                                self.db.update_doc("requisicoes", row['id'], {"status": "Pedido Gerado"},
+                                                   st.session_state.username)
+                                st.toast("🚀 Pedido gerado!", icon="🚀");
+                                time.sleep(1);
                                 st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao gerar pedido: {e}")
 
-                selected_rc_details = df_rc[df_rc['id'] == selected_id_rc].iloc[0]
-                if selected_rc_details['status'] == 'Finalizado':
-                    pedido_existente = fetch_data("SELECT id FROM pedidos WHERE rc_id = :rc_id", {"rc_id": selected_id_rc})
-                    with col_gerar_pedido:
-                        if pedido_existente.empty:
-                            if st.button("🛒 Gerar Pedido", use_container_width=True):
-                                st.session_state.rc_id_para_pedido = selected_id_rc
-                                st.session_state.show_pedido_form = True
-                                st.session_state.pedido_edit_id = None
-                                st.rerun()
-                        else:
-                            st.info(f"Pedido já existe.")
-
-# --- PEDIDOS EM ANDAMENTO ---
-with tab_pedidos_andamento:
-    st.header("Pedidos de Compra em Andamento")
-    with st.expander("Filtros e Relatórios de Pedidos"):
-        filtro_status_pedido = st.multiselect("Filtrar por Status do Pedido", options=["Aguardando Entrega", "Entregue Parcialmente", "Atrasado", "Cancelado"])
-        c1, c2 = st.columns(2)
-        with c1:
-            filtro_data_inicio_pedido = st.date_input("Data de Início do Pedido", value=None)
-        with c2:
-            filtro_data_fim_pedido = st.date_input("Data de Fim do Pedido", value=None)
-
-    query_pedidos = "SELECT p.id, p.rc_id, r.numero_rc, p.data_pedido, p.numero_pedido, p.previsao_entrega, p.status_pedido, r.solicitante, p.observacoes_pedido FROM requisicoes r JOIN pedidos p ON r.id = p.rc_id WHERE p.status_pedido != 'Entregue'"
-    params_pedidos = {}
-    if filtro_status_pedido:
-        query_pedidos += " AND p.status_pedido = ANY(ARRAY[:status]::text[])"
-        params_pedidos["status"] = filtro_status_pedido
-    if filtro_data_inicio_pedido:
-        query_pedidos += " AND p.data_pedido >= :data_inicio"
-        params_pedidos["data_inicio"] = str(filtro_data_inicio_pedido)
-    if filtro_data_fim_pedido:
-        query_pedidos += " AND p.data_pedido <= :data_fim"
-        params_pedidos["data_fim"] = str(filtro_data_fim_pedido)
-    query_pedidos += " ORDER BY p.id DESC"
-
-    df_pedidos = fetch_data(query_pedidos, params_pedidos)
-    if not df_pedidos.empty:
-        st.download_button(
-            label="📥 Exportar Pedidos para Excel",
-            data=to_excel(df_pedidos, "Pedidos em Andamento"),
-            file_name='pedidos_em_andamento.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        )
-
-    if df_pedidos.empty:
-        st.info("Nenhum pedido de compra encontrado com os filtros aplicados.")
-    else:
-        st.dataframe(df_pedidos, use_container_width=True, hide_index=True)
-        if st.session_state.role != 'gestor':
-            st.subheader("Operações com o Pedido Selecionado")
-            pedido_ids = df_pedidos['id'].tolist()
-            selected_id_pedido = st.selectbox("Selecione um Pedido", options=pedido_ids, format_func=lambda x: f"Pedido Nº {x}", key="select_pedido")
-            if selected_id_pedido:
-                col_edit, col_delete, col_finalize, col_space = st.columns([1.5, 1.5, 2, 5])
-                with col_edit:
-                    if st.button("✏️ Editar Pedido", use_container_width=True):
-                        st.session_state.pedido_edit_id = selected_id_pedido
-                        st.session_state.show_pedido_form = True
+            # Confirmação de exclusão
+            if st.session_state.confirm_delete.get('id') == row['id']:
+                st.warning(f"Tem certeza que quer excluir '{st.session_state.confirm_delete['desc']}'?")
+                c1, c2, _ = st.columns([1, 1, 8])
+                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
+                    with st.spinner("Excluindo..."):
+                        self.db.delete_doc(collection, row['id']);
+                        st.session_state.confirm_delete = {};
                         st.rerun()
-                with col_delete:
-                    if st.button("🗑️ Excluir Pedido", use_container_width=True, type="secondary"):
-                        st.session_state.confirm_delete['pedido'] = selected_id_pedido
-                        st.rerun()
-                selected_pedido_details = df_pedidos[df_pedidos['id'] == selected_id_pedido].iloc[0]
-                if selected_pedido_details['status_pedido'] not in ['Entregue', 'Cancelado']:
-                    with col_finalize:
-                        if st.button("✅ Finalizar Pedido", use_container_width=True):
-                            st.session_state.pedido_to_finalize = selected_id_pedido
-                            st.rerun()
-                if st.session_state.confirm_delete.get('pedido') == selected_id_pedido:
-                    st.warning(f"Tem certeza que deseja excluir o Pedido Nº {selected_id_pedido}?")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Sim, excluir pedido", use_container_width=True, type="primary"):
-                            if execute_query("DELETE FROM pedidos WHERE id = :id", {"id": selected_id_pedido}):
-                                st.toast(f"Pedido Nº {selected_id_pedido} excluído!", icon="🗑️")
-                                st.session_state.confirm_delete = {}
-                                st.rerun()
-                    with c2:
-                        if st.button("Cancelar exclusão", use_container_width=True):
-                            st.session_state.confirm_delete = {}
-                            st.rerun()
-                if 'pedido_to_finalize' in st.session_state and st.session_state.pedido_to_finalize == selected_id_pedido:
-                    st.warning("Tem certeza que deseja marcar este pedido como FINALIZADO?")
-                    st.info("Esta ação irá:")
-                    st.info("- Marcar o pedido como 'Entregue'")
-                    st.info("- Atualizar a demanda relacionada para 'Finalizado'")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Sim, Finalizar Pedido", use_container_width=True, type="primary"):
-                            if execute_query("UPDATE pedidos SET status_pedido = 'Entregue' WHERE id = :id", {"id": selected_id_pedido}):
-                                rc_info = fetch_data("SELECT demanda_id FROM requisicoes WHERE id = (SELECT rc_id FROM pedidos WHERE id = :id)", {"id": selected_id_pedido})
-                                if not rc_info.empty and rc_info.iloc[0]['demanda_id']:
-                                    execute_query("UPDATE demandas SET status_demanda = 'Finalizada' WHERE id = :id", {"id": rc_info.iloc[0]['demanda_id']})
-                                st.toast(f"Pedido Nº {selected_id_pedido} finalizado com sucesso!")
-                                del st.session_state.pedido_to_finalize
-                                st.rerun()
-                    with c2:
-                        if st.button("Cancelar", use_container_width=True):
-                            del st.session_state.pedido_to_finalize
-                            st.rerun()
+                if c2.button("Cancelar", key=f"canc_del_{key}"):
+                    st.session_state.confirm_delete = {};
+                    st.rerun()
 
-# --- PEDIDOS FINALIZADOS ---
-with tab_pedidos_finalizados:
-    st.header("Pedidos de Compra Finalizados")
-    query_finalizados = "SELECT p.id, p.rc_id, r.numero_rc, p.data_pedido, p.numero_pedido, p.previsao_entrega, p.status_pedido, r.solicitante, p.observacoes_pedido FROM requisicoes r JOIN pedidos p ON r.id = p.rc_id WHERE p.status_pedido = 'Entregue' ORDER BY p.id DESC"
-    df_finalizados = fetch_data(query_finalizados)
-    if df_finalizados.empty:
-        st.info("Nenhum pedido finalizado encontrado.")
-    else:
-        st.download_button(
-            label="📥 Exportar Pedidos Finalizados para Excel",
-            data=to_excel(df_finalizados, "Pedidos Finalizados"),
-            file_name='pedidos_finalizados.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        )
-        st.dataframe(df_finalizados, use_container_width=True, hide_index=True)
+    @st.dialog("Histórico de Alterações")
+    def render_history_modal(self):
+        """Renderiza o histórico de um item num dialog (modal)."""
+        if not st.session_state.view_history_id:
+            return
+        info = st.session_state.view_history_id
+        st.markdown(f"**ID do Documento:** `{info['id']}`")
+        historico = info['data'].get('historico', ["Nenhum histórico encontrado."])
+
+        for entry in reversed(historico):  # Mostra o mais recente primeiro
+            st.info(entry)
+
+        if st.button("Fechar", key=f"close_hist_{info['id']}"):
+            st.session_state.view_history_id = None
+            st.rerun()
+
+    def render_edit_modal(self):
+        """Renderiza o formulário de edição num modal se um item for selecionado."""
+        if st.session_state.edit_id:
+            edit_info = st.session_state.edit_id
+            with st.form(key=f"edit_form_{edit_info['id']}"):
+                st.subheader(f"Editando {edit_info['collection'][:-1].capitalize()} ID: ...{edit_info['id'][-6:]}")
+                data, new_data = edit_info['data'], {}
+
+                if edit_info['collection'] == 'demandas':
+                    new_data['descricao_necessidade'] = st.text_area("Descrição", data.get('descricao_necessidade', ''))
+                    new_data['categoria'] = st.text_input("Categoria", data.get('categoria', ''))
+                    opts = ["Aberta", "Em Atendimento", "Fechada", "Cancelada"]
+                    new_data['status_demanda'] = st.selectbox("Status", opts,
+                                                              index=opts.index(data.get('status_demanda')))
+                elif edit_info['collection'] == 'requisicoes':
+                    new_data['numero_rc'] = st.text_input("Número da RC", data.get('numero_rc', ''))
+                    new_data['valor'] = st.number_input("Valor (R$)", min_value=0.01, value=data.get('valor'),
+                                                        format="%.2f")
+                    opts = ["Aberto", "Pedido Gerado", "Cancelado"]
+                    new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
+                elif edit_info['collection'] == 'pedidos':
+                    new_data['numero_pedido'] = st.text_input("Número do Pedido", data.get('numero_pedido', ''))
+                    opts = ["Em Processamento", "Em Transporte", "Entregue", "Cancelado"]
+                    new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
+
+                    entrega_val = data.get('data_entrega')
+                    if pd.notna(entrega_val):
+                        entrega_val = pd.to_datetime(entrega_val).date()
+                    else:
+                        entrega_val = None
+
+                    data_entrega_input = st.date_input("Data de Entrega", value=entrega_val)
+                    if data_entrega_input:
+                        new_data['data_entrega'] = datetime.combine(data_entrega_input, datetime.min.time())
+                    else:
+                        new_data['data_entrega'] = None
+
+                    new_data['observacao'] = st.text_area("Observação", data.get('observacao', ''))
+
+                c1, c2 = st.columns(2)
+                if c1.form_submit_button("Salvar Alterações", type="primary"):
+                    with st.spinner("Salvando alterações..."):
+                        if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data,
+                                              st.session_state.username):
+                            st.toast("💾 Atualizado!", icon="💾");
+                            st.session_state.edit_id = None;
+                            time.sleep(1);
+                            st.rerun()
+                if c2.form_submit_button("Cancelar"):
+                    st.session_state.edit_id = None;
+                    st.rerun()
+
+    def _generate_backup_data(self) -> bytes:
+        """Gera os dados de backup como bytes para download."""
+        try:
+            logger.info("Iniciando processo de geração de backup local.")
+            collections_to_backup = ["users", "demandas", "requisicoes", "pedidos"]
+            backup_data = {}
+            for col in collections_to_backup:
+                docs_df = self.db.get_docs(col)
+                # Converte tipos de dados não serializáveis para string
+                for col_name in docs_df.columns:
+                    if docs_df[col_name].apply(lambda x: isinstance(x, bytes)).any():
+                        docs_df[col_name] = docs_df[col_name].apply(
+                            lambda x: base64.b64encode(x).decode('utf-8') if isinstance(x, bytes) else x)
+                    if pd.api.types.is_datetime64_any_dtype(docs_df[col_name]):
+                        docs_df[col_name] = docs_df[col_name].astype(str)
+
+                backup_data[col] = docs_df.to_dict(orient='records')
+
+            return json.dumps(backup_data, ensure_ascii=False, indent=4).encode('utf-8')
+        except Exception as e:
+            logger.error(f"Falha ao gerar dados de backup: {e}", exc_info=True)
+            st.error(f"Erro ao gerar dados de backup: {e}")
+            return b""
+
+
+# -----------------------------------------------------------------------------
+# 4. PONTO DE ENTRADA DA APLICAÇÃO
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    try:
+        if "firebase_credentials" not in st.secrets:
+            st.error("Credenciais do Firebase não encontradas! Verifique seu arquivo secrets.toml.")
+            st.stop()
+
+        db_service = FirebaseService(dict(st.secrets["firebase_credentials"]))
+        auth_service = AuthService(db_service)
+        app = ViewManager(auth_service, db_service)
+        app.run()
+    except Exception as e:
+        st.error("Ocorreu um erro crítico na aplicação.")
+        st.exception(e)
+        logger.critical(f"Erro crítico na aplicação: {e}", exc_info=True)
