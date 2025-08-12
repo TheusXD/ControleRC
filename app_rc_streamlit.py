@@ -34,6 +34,7 @@ class Demanda(BaseModel):
     """Schema de validação para uma Demanda."""
     solicitante_demanda: constr(min_length=1)
     descricao_necessidade: constr(min_length=5)
+    tipo: str  # Campo para "Material" ou "Serviço"
     categoria: constr(min_length=1)
     # Armazena o nome, tipo e os dados do anexo em Base64
     anexo: Optional[Dict[str, str]] = None
@@ -83,8 +84,9 @@ class FirebaseService:
             # A inicialização do Storage foi removida para não causar erro.
             firebase_admin.initialize_app(cert)
         self.db = firestore.client()
-        self.bucket = None  # Bucket não será usado nesta versão.
+        self.bucket = None # Bucket não será usado nesta versão.
         logger.info("Firebase Service inicializado sem Storage Bucket.")
+
 
     def get_doc(self, collection: str, doc_id: str) -> Optional[Dict[str, Any]]:
         """Busca um único documento pelo ID."""
@@ -190,8 +192,7 @@ class FirebaseService:
                     if 'created_at' in doc_data and isinstance(doc_data['created_at'], str):
                         doc_data['created_at'] = datetime.fromisoformat(doc_data['created_at'])
                     if 'data_entrega' in doc_data and isinstance(doc_data.get('data_entrega'), str):
-                        doc_data['data_entrega'] = datetime.fromisoformat(doc_data['data_entrega']) if doc_data[
-                            'data_entrega'] else None
+                        doc_data['data_entrega'] = datetime.fromisoformat(doc_data['data_entrega']) if doc_data['data_entrega'] else None
                     if 'password' in doc_data and isinstance(doc_data['password'], str):
                         doc_data['password'] = base64.b64decode(doc_data['password'])
                     if 'salt' in doc_data and isinstance(doc_data['salt'], str):
@@ -222,15 +223,11 @@ class AuthService:
     def _check_password(self, stored_password, salt, provided_password: str) -> bool:
         if salt is None or stored_password is None: return False
         if isinstance(salt, str):
-            try:
-                salt = base64.b64decode(salt)
-            except (ValueError, TypeError):
-                return False
+            try: salt = base64.b64decode(salt)
+            except (ValueError, TypeError): return False
         if isinstance(stored_password, str):
-            try:
-                stored_password = base64.b64decode(stored_password)
-            except (ValueError, TypeError):
-                return False
+            try: stored_password = base64.b64decode(stored_password)
+            except (ValueError, TypeError): return False
         return stored_password == hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
 
     def _validate_password_strength(self, password: str) -> bool:
@@ -246,20 +243,16 @@ class AuthService:
             return
 
         if not self.db.get_docs("users", [("username", "==", username)]).empty:
-            st.error("Este nome de usuário já existe.");
-            return
+            st.error("Este nome de usuário já existe."); return
 
         role = "admin" if self.db.get_docs("users").empty else "gestor" if is_gestor else "user"
         status = "active" if role == "admin" or not is_gestor else "pending"
         hashed_pw, salt = self._hash_password(password)
-        user_data = {"username": username, "password": hashed_pw, "salt": salt, "role": role, "status": status,
-                     "created_at": datetime.now()}
+        user_data = {"username": username, "password": hashed_pw, "salt": salt, "role": role, "status": status, "created_at": datetime.now()}
 
         if self.db.add_doc("users", user_data):
             st.success(f"Usuário '{username}' registrado como '{role}'. Status: {status}")
-            time.sleep(2);
-            st.session_state.page = "Login";
-            st.rerun()
+            time.sleep(2); st.session_state.page = "Login"; st.rerun()
 
     def login_user(self, username, password):
         user_df = self.db.get_docs("users", [("username", "==", username)])
@@ -282,9 +275,7 @@ class AuthService:
         if 'last_activity' in st.session_state:
             if time.time() - st.session_state.last_activity > self.SESSION_TIMEOUT_MINUTES * 60:
                 for key in list(st.session_state.keys()): del st.session_state[key]
-                st.warning("Sessão expirada. Faça login novamente.");
-                time.sleep(3);
-                st.rerun()
+                st.warning("Sessão expirada. Faça login novamente."); time.sleep(3); st.rerun()
         st.session_state.last_activity = time.time()
 
     def change_password(self, username, old_password, new_password):
@@ -292,21 +283,17 @@ class AuthService:
         if user_df.empty: st.error("Usuário não encontrado."); return False
         user_data = user_df.iloc[0]
         if not self._check_password(user_data['password'], user_data['salt'], old_password):
-            st.error("A senha antiga está incorreta.");
-            return False
+            st.error("A senha antiga está incorreta."); return False
         if not self._validate_password_strength(new_password):
-            st.error("A nova senha não é forte o suficiente.");
-            return False
+            st.error("A nova senha não é forte o suficiente."); return False
         hashed_pw, salt = self._hash_password(new_password)
         if self.db.update_doc("users", user_data['id'], {"password": hashed_pw, "salt": salt}, username):
-            st.success("Senha alterada com sucesso!");
-            return True
+            st.success("Senha alterada com sucesso!"); return True
         return False
 
     def reset_password_by_admin(self, user_id, new_password):
         if not self._validate_password_strength(new_password):
-            st.error("A nova senha não é forte o suficiente.");
-            return False
+            st.error("A nova senha não é forte o suficiente."); return False
         hashed_pw, salt = self._hash_password(new_password)
         return self.db.update_doc("users", user_id, {"password": hashed_pw, "salt": salt}, st.session_state.username)
 
@@ -314,6 +301,26 @@ class AuthService:
 # -----------------------------------------------------------------------------
 # 3. UI / VIEWS (LÓGICA DE APRESENTAÇÃO)
 # -----------------------------------------------------------------------------
+
+def parse_brazilian_float(text: str) -> float:
+    """Converte uma string de número no formato brasileiro para float."""
+    if not isinstance(text, str) or not text:
+        return 0.0
+    try:
+        # Remove pontos (separador de milhar) e substitui vírgula (decimal) por ponto
+        cleaned_text = text.replace('.', '').replace(',', '.')
+        return float(cleaned_text)
+    except ValueError:
+        st.error(f"Valor '{text}' inválido. Use o formato numérico correto, como 1.234,56")
+        raise ValueError("Formato de valor inválido")
+
+def format_brazilian_currency(value: float) -> str:
+    """Formata um número float para a convenção de moeda brasileira (R$ 1.234,56)."""
+    if not isinstance(value, (int, float)):
+        return "R$ 0,00"
+    # Formata com _ para milhar e . para decimal, depois substitui
+    formatted_value = f"{value:_.2f}".replace('.', ',').replace('_', '.')
+    return f"R$ {formatted_value}"
 
 def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
     output = io.BytesIO()
@@ -325,8 +332,7 @@ def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
         workbook, worksheet = writer.book, writer.sheets[title]
         header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
-        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'),
-                        bottom=Side(style='thin'))
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
         alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         for col_num, col_name in enumerate(df_copy.columns, 1):
             cell = worksheet.cell(row=1, column=col_num)
@@ -351,14 +357,10 @@ def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
             status_col_index = df_copy.columns.get_loc(status_col_name) + 1
             for row in range(2, len(df_copy) + 2):
                 cell = worksheet.cell(row=row, column=status_col_index)
-                if cell.value in ['Finalizado', 'Entregue', 'Fechada']:
-                    cell.fill = fills['green']
-                elif cell.value in ['Cancelado', 'Rejeitado']:
-                    cell.fill = fills['red']
-                elif cell.value in ['Em Processamento', 'Em Atendimento', 'Em Transporte', 'Pedido Gerado']:
-                    cell.fill = fills['yellow']
-                elif cell.value in ['Aberto', 'Aberta']:
-                    cell.fill = fills['blue']
+                if cell.value in ['Finalizado', 'Entregue', 'Fechada']: cell.fill = fills['green']
+                elif cell.value in ['Cancelado', 'Rejeitado']: cell.fill = fills['red']
+                elif cell.value in ['Em Processamento', 'Em Atendimento', 'Em Transporte', 'Pedido Gerado']: cell.fill = fills['yellow']
+                elif cell.value in ['Aberto', 'Aberta']: cell.fill = fills['blue']
         worksheet.freeze_panes = 'A2'
         worksheet.auto_filter.ref = worksheet.dimensions
     return output.getvalue()
@@ -370,25 +372,18 @@ class ViewManager:
         self._init_session_state()
 
     def _init_session_state(self):
-        defaults = {'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'confirm_delete': {},
-                    'edit_id': None, 'confirm_delete_user': {}, 'reset_password_for_user': {},
-                    'create_rc_from_demanda_id': None, 'view_history_id': None, 'confirm_restore': None,
-                    'show_notifications': False, 'notifications': []}
+        defaults = {'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'confirm_delete': {}, 'edit_id': None, 'confirm_delete_user': {}, 'reset_password_for_user': {}, 'create_rc_from_demanda_id': None, 'view_history_id': None, 'confirm_restore': None, 'show_notifications': False, 'notifications': []}
         for key, value in defaults.items():
             if key not in st.session_state: st.session_state[key] = value
 
     def run(self):
-        if not st.session_state.logged_in:
-            self.render_login_page()
-        else:
-            self.auth.check_session_timeout(); self.render_main_app()
+        if not st.session_state.logged_in: self.render_login_page()
+        else: self.auth.check_session_timeout(); self.render_main_app()
 
     def render_login_page(self):
         _, col2, _ = st.columns([1, 2, 1])
         with col2:
-            st.markdown(
-                """<div style="text-align: center; margin-bottom: 2rem;"><span style="font-family: sans-serif; font-size: 4rem; font-weight: 900; color: var(--text-color);">ATIBAIA</span><span style="font-family: sans-serif; font-size: 4rem; font-weight: 900; color: #00AEEF;">💧</span><div style="font-family: sans-serif; font-size: 2.5rem; color: #00AEEF; letter-spacing: 0.1rem; margin-top: -1rem;">SANEAMENTO</div></div>""",
-                unsafe_allow_html=True)
+            st.markdown("""<div style="text-align: center; margin-bottom: 2rem;"><span style="font-family: sans-serif; font-size: 4rem; font-weight: 900; color: var(--text-color);">ATIBAIA</span><span style="font-family: sans-serif; font-size: 4rem; font-weight: 900; color: #00AEEF;">💧</span><div style="font-family: sans-serif; font-size: 2.5rem; color: #00AEEF; letter-spacing: 0.1rem; margin-top: -1rem;">SANEAMENTO</div></div>""", unsafe_allow_html=True)
             if st.session_state.page == "Login":
                 self._render_login_form()
                 if st.button("Não tem conta? Registre-se"): st.session_state.page = "Registro"; st.rerun()
@@ -405,32 +400,22 @@ class ViewManager:
     def _render_registration_form(self):
         st.title("📝 Registro de Novo Usuário")
         with st.form("registration_form"):
-            username, password, is_gestor = st.text_input("Nome de Usuário"), st.text_input("Senha",
-                                                                                            type="password"), st.checkbox(
-                "Sou um gestor (requer aprovação do admin)")
-            if st.form_submit_button("Registrar", type="primary"): self.auth.register_user(username, password,
-                                                                                           is_gestor)
+            username, password, is_gestor = st.text_input("Nome de Usuário"), st.text_input("Senha", type="password"), st.checkbox("Sou um gestor (requer aprovação do admin)")
+            if st.form_submit_button("Registrar", type="primary"): self.auth.register_user(username, password, is_gestor)
 
     def render_main_app(self):
         self.render_sidebar()
         col1, col2 = st.columns([0.8, 0.2])
-        with col1:
-            st.title("🚀 Sistema de Controle de Compras")
-        with col2:
-            self.render_notification_bell()
+        with col1: st.title("🚀 Sistema de Controle de Compras")
+        with col2: self.render_notification_bell()
         self.render_edit_modal()
         if st.session_state.view_history_id: self.render_history_modal()
         if st.session_state.get('show_notifications', False): self.render_notifications_modal()
-        tab_dashboard, tab_demandas, tab_rcs, tab_pedidos = st.tabs(
-            ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"])
-        with tab_dashboard:
-            self.render_dashboard()
-        with tab_demandas:
-            self.render_demandas()
-        with tab_rcs:
-            self.render_requisicoes()
-        with tab_pedidos:
-            self.render_pedidos()
+        tab_dashboard, tab_demandas, tab_rcs, tab_pedidos = st.tabs(["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"])
+        with tab_dashboard: self.render_dashboard()
+        with tab_demandas: self.render_demandas()
+        with tab_rcs: self.render_requisicoes()
+        with tab_pedidos: self.render_pedidos()
 
     def render_sidebar(self):
         with st.sidebar:
@@ -438,15 +423,11 @@ class ViewManager:
             with st.expander("Meu Perfil"):
                 with st.form("change_password_form", clear_on_submit=True):
                     st.subheader("Alterar Senha")
-                    old_p, new_p, conf_p = st.text_input("Senha Antiga", type="password"), st.text_input("Nova Senha",
-                                                                                                         type="password"), st.text_input(
-                        "Confirmar Nova Senha", type="password")
+                    old_p, new_p, conf_p = st.text_input("Senha Antiga", type="password"), st.text_input("Nova Senha", type="password"), st.text_input("Confirmar Nova Senha", type="password")
                     if st.form_submit_button("Alterar Senha", type="primary"):
-                        if new_p != conf_p:
-                            st.error("As novas senhas não coincidem.")
+                        if new_p != conf_p: st.error("As novas senhas não coincidem.")
                         else:
-                            if self.auth.change_password(st.session_state.username, old_p, new_p): time.sleep(
-                                2); st.rerun()
+                            if self.auth.change_password(st.session_state.username, old_p, new_p): time.sleep(2); st.rerun()
             if st.button("Logout", use_container_width=True):
                 for key in list(st.session_state.keys()): del st.session_state[key]
                 st.rerun()
@@ -463,11 +444,8 @@ class ViewManager:
                 for _, user in pending_users.iterrows():
                     c1, c2, c3 = st.columns([2, 1, 1])
                     c1.write(f"{user['username']} ({user['role']})")
-                    if c2.button("✅", key=f"a_{user['id']}", help="Aprovar"): self.db.update_doc("users", user['id'],
-                                                                                                 {"status": "active"},
-                                                                                                 st.session_state.username); st.rerun()
-                    if c3.button("🗑️", key=f"r_{user['id']}", help="Rejeitar"): self.db.delete_doc("users", user[
-                        'id']); st.rerun()
+                    if c2.button("✅", key=f"a_{user['id']}", help="Aprovar"): self.db.update_doc("users", user['id'], {"status": "active"}, st.session_state.username); st.rerun()
+                    if c3.button("🗑️", key=f"r_{user['id']}", help="Rejeitar"): self.db.delete_doc("users", user['id']); st.rerun()
                 st.divider()
             st.subheader("Usuários Ativos")
             active_users = self.db.get_docs("users", [("status", "==", "active")])
@@ -475,37 +453,23 @@ class ViewManager:
                 is_self = user['username'] == st.session_state.username
                 c1, c2, c3 = st.columns([3, 1, 1])
                 c1.write(f"**{user['username']}** ({user['role']}){' (Você)' if is_self else ''}")
-                if c2.button("🔑", key=f"reset_pw_{user['id']}", help="Redefinir Senha",
-                             disabled=is_self): st.session_state.reset_password_for_user = {'id': user['id'],
-                                                                                            'username': user[
-                                                                                                'username']}; st.rerun()
-                if c3.button("🗑️", key=f"del_user_{user['id']}", help="Excluir Usuário",
-                             disabled=is_self): st.session_state.confirm_delete_user = {'id': user['id'],
-                                                                                        'username': user[
-                                                                                            'username']}; st.rerun()
+                if c2.button("🔑", key=f"reset_pw_{user['id']}", help="Redefinir Senha", disabled=is_self): st.session_state.reset_password_for_user = {'id': user['id'], 'username': user['username']}; st.rerun()
+                if c3.button("🗑️", key=f"del_user_{user['id']}", help="Excluir Usuário", disabled=is_self): st.session_state.confirm_delete_user = {'id': user['id'], 'username': user['username']}; st.rerun()
                 if st.session_state.get('reset_password_for_user', {}).get('id') == user['id']:
                     with st.form(key=f"reset_form_{user['id']}", clear_on_submit=True):
-                        st.warning(
-                            f"Redefinindo senha para **{st.session_state.reset_password_for_user['username']}**.")
+                        st.warning(f"Redefinindo senha para **{st.session_state.reset_password_for_user['username']}**.")
                         new_pass = st.text_input("Nova Senha", type="password")
                         if st.form_submit_button("Confirmar", type="primary"):
-                            if self.auth.reset_password_by_admin(user['id'], new_pass): st.toast(
-                                f"Senha para {user['username']} redefinida.",
-                                icon="🔑"); del st.session_state.reset_password_for_user; time.sleep(1); st.rerun()
+                            if self.auth.reset_password_by_admin(user['id'], new_pass): st.toast(f"Senha para {user['username']} redefinida.", icon="🔑"); del st.session_state.reset_password_for_user; time.sleep(1); st.rerun()
                         if st.form_submit_button("Cancelar"): del st.session_state.reset_password_for_user; st.rerun()
                 if st.session_state.get('confirm_delete_user', {}).get('id') == user['id']:
                     st.error(f"Excluir **{st.session_state.confirm_delete_user['username']}**?")
                     c1, c2, _ = st.columns([1, 1, 3])
-                    if c1.button("Sim, excluir", key=f"conf_del_u_{user['id']}", type="primary"): self.db.delete_doc(
-                        "users", user['id']); del st.session_state.confirm_delete_user; st.toast(
-                        f"Usuário {user['username']} excluído.", icon="🗑️"); time.sleep(1); st.rerun()
-                    if c2.button("Cancelar",
-                                 key=f"canc_del_u_{user['id']}"): del st.session_state.confirm_delete_user; st.rerun()
+                    if c1.button("Sim, excluir", key=f"conf_del_u_{user['id']}", type="primary"): self.db.delete_doc("users", user['id']); del st.session_state.confirm_delete_user; st.toast(f"Usuário {user['username']} excluído.", icon="🗑️"); time.sleep(1); st.rerun()
+                    if c2.button("Cancelar", key=f"canc_del_u_{user['id']}"): del st.session_state.confirm_delete_user; st.rerun()
         st.divider()
         st.subheader("Backup e Restauro Local")
-        st.download_button(label="📥 Baixar Backup Local", data=self._generate_backup_data(),
-                           file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json",
-                           use_container_width=True, type="primary")
+        st.download_button(label="📥 Baixar Backup Local", data=self._generate_backup_data(), file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json", use_container_width=True, type="primary")
         uploaded_file = st.file_uploader("Restaurar a partir de arquivo (.json)", type="json")
         if uploaded_file:
             if st.button("Restaurar Backup"): st.session_state.confirm_restore = uploaded_file; st.rerun()
@@ -513,8 +477,7 @@ class ViewManager:
             st.error(f"Restaurar '{st.session_state.confirm_restore.name}'? Dados atuais serão perdidos.")
             rc1, rc2, _ = st.columns([1, 1, 3])
             if rc1.button("Sim, restaurar", key="conf_restore_l", type="primary"):
-                if self.db.restore_from_backup_data(json.load(st.session_state.confirm_restore)): st.success(
-                    "Backup restaurado!"); del st.session_state.confirm_restore; time.sleep(2); st.rerun()
+                if self.db.restore_from_backup_data(json.load(st.session_state.confirm_restore)): st.success("Backup restaurado!"); del st.session_state.confirm_restore; time.sleep(2); st.rerun()
             if rc2.button("Cancelar", key="canc_restore_l"): del st.session_state.confirm_restore; st.rerun()
 
     def render_notification_bell(self):
@@ -522,17 +485,14 @@ class ViewManager:
         if st.session_state.role == 'admin':
             pending_users = self.db.get_docs("users", [("status", "==", "pending")])
             num_notifications = len(pending_users)
-            st.session_state.notifications = [f"Aprovação pendente: {user['username']}" for _, user in
-                                              pending_users.iterrows()] if num_notifications > 0 else []
+            st.session_state.notifications = [f"Aprovação pendente: {user['username']}" for _, user in pending_users.iterrows()] if num_notifications > 0 else []
         label = f"🔔 ({num_notifications})" if num_notifications > 0 else "🔔"
-        if st.button(label, help="Ver notificações"): st.session_state.show_notifications = not st.session_state.get(
-            'show_notifications', False); st.rerun()
+        if st.button(label, help="Ver notificações"): st.session_state.show_notifications = not st.session_state.get('show_notifications', False); st.rerun()
 
     @st.dialog("🔔 Notificações")
     def render_notifications_modal(self):
         notifications = st.session_state.get('notifications', [])
-        if not notifications:
-            st.info("Nenhuma notificação nova.")
+        if not notifications: st.info("Nenhuma notificação nova.")
         else:
             for n in notifications: st.warning(n)
         if st.button("Fechar", key="close_notifications"): st.session_state.show_notifications = False; st.rerun()
@@ -564,33 +524,23 @@ class ViewManager:
 
     def render_dashboard(self):
         st.header("Dashboard de Métricas")
-        df_demandas, df_rc, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs(
-            "requisicoes"), self.db.get_docs("pedidos")
+        df_demandas, df_rc, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs("requisicoes"), self.db.get_docs("pedidos")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
         c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
         c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
-        c4.metric("Valor Total em RCs", f"R$ {df_rc['valor'].sum() if not df_rc.empty else 0:,.2f}")
+        total_valor_rc = df_rc['valor'].sum() if not df_rc.empty else 0
+        c4.metric("Valor Total em RCs", format_brazilian_currency(total_valor_rc))
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Status das Demandas")
-            if not df_demandas.empty:
-                st.plotly_chart(
-                    px.bar(df_demandas['status_demanda'].value_counts().reset_index(), x='status_demanda', y='count',
-                           title="Distribuição de Status", text_auto=True, color='status_demanda',
-                           labels={'status_demanda': 'Status', 'count': 'Quantidade'}), use_container_width=True)
-            else:
-                st.info("Nenhuma demanda para exibir.")
+            if not df_demandas.empty: st.plotly_chart(px.bar(df_demandas['status_demanda'].value_counts().reset_index(), x='status_demanda', y='count', title="Distribuição de Status", text_auto=True, color='status_demanda', labels={'status_demanda': 'Status', 'count': 'Quantidade'}), use_container_width=True)
+            else: st.info("Nenhuma demanda para exibir.")
         with c2:
             st.subheader("Demandas por Categoria")
-            if not df_demandas.empty:
-                st.plotly_chart(
-                    px.pie(df_demandas['categoria'].value_counts().reset_index(), names='categoria', values='count',
-                           title="Distribuição por Categoria", hole=.3,
-                           labels={'categoria': 'Categoria', 'count': 'Quantidade'}), use_container_width=True)
-            else:
-                st.info("Nenhuma categoria para exibir.")
+            if not df_demandas.empty: st.plotly_chart(px.pie(df_demandas['categoria'].value_counts().reset_index(), names='categoria', values='count', title="Distribuição por Categoria", hole=.3, labels={'categoria': 'Categoria', 'count': 'Quantidade'}), use_container_width=True)
+            else: st.info("Nenhuma categoria para exibir.")
 
     def render_demandas(self):
         st.header("Demandas de Compras")
@@ -598,33 +548,27 @@ class ViewManager:
             with st.expander("➕ Adicionar Nova Demanda"):
                 with st.form("demanda_form", clear_on_submit=True):
                     descricao = st.text_area("Descrição da Necessidade")
+                    tipo = st.selectbox("Tipo", ["Material", "Serviço"], index=None, placeholder="Selecione o tipo...")
                     categoria = st.text_input("Categoria")
                     uploaded_file = st.file_uploader("Anexo (Opcional, máx 750KB)")
                     if st.form_submit_button("Registrar Demanda", type="primary"):
-                        if not descricao or not categoria: st.error("Preencha Descrição e Categoria."); return
+                        if not descricao or not categoria or not tipo:
+                            st.error("Preencha todos os campos obrigatórios (Descrição, Tipo e Categoria).")
+                            return
                         with st.spinner("Registrando demanda..."):
                             anexo_data_dict = None
                             if uploaded_file:
-                                if uploaded_file.size > 750 * 1024: st.error(
-                                    "Arquivo muito grande! O anexo deve ter no máximo 750 KB."); st.stop()
+                                if uploaded_file.size > 750 * 1024: st.error("Arquivo muito grande! O anexo deve ter no máximo 750 KB."); st.stop()
                                 b64_data = base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
-                                anexo_data_dict = {"file_name": uploaded_file.name, "content_type": uploaded_file.type,
-                                                   "b64_data": b64_data}
+                                anexo_data_dict = {"file_name": uploaded_file.name, "content_type": uploaded_file.type, "b64_data": b64_data}
                             try:
-                                demanda = Demanda(solicitante_demanda=st.session_state.username,
-                                                  descricao_necessidade=descricao, categoria=categoria,
-                                                  anexo=anexo_data_dict)
+                                demanda = Demanda(solicitante_demanda=st.session_state.username, descricao_necessidade=descricao, tipo=tipo, categoria=categoria, anexo=anexo_data_dict)
                                 demanda_data = demanda.model_dump()
-                                demanda_data['historico'] = [
-                                    f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
-                                if self.db.add_doc("demandas", demanda_data): st.toast("✅ Demanda registrada!",
-                                                                                       icon="✅"); time.sleep(
-                                    1); st.rerun()
-                            except ValidationError as e:
-                                st.error(f"Erro de validação: {e}")
+                                demanda_data['historico'] = [f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                                if self.db.add_doc("demandas", demanda_data): st.toast("✅ Demanda registrada!", icon="✅"); time.sleep(1); st.rerun()
+                            except ValidationError as e: st.error(f"Erro de validação: {e}")
         st.header("Demandas Registradas")
-        self._render_paginated_rows(self.db.get_docs("demandas"), lambda row: self.render_data_row("demandas", row),
-                                    "demandas")
+        self._render_paginated_rows(self.db.get_docs("demandas"), lambda row: self.render_data_row("demandas", row), "demandas")
 
     def render_requisicoes(self):
         st.header("Requisições de Compra (RCs)")
@@ -632,51 +576,40 @@ class ViewManager:
             with st.expander("➕ Adicionar Nova Requisição"):
                 st.subheader("Passo 1: Selecione a Demanda")
                 df_demandas_abertas = self.db.get_docs("demandas", [("status_demanda", "==", "Aberta")])
-                demanda_options = {"Selecione uma Demanda": None,
-                                   **{f"ID: ...{r['id'][-6:]} - {r['descricao_necessidade'][:40]}...": r['id'] for _, r
-                                      in df_demandas_abertas.iterrows()}}
-                selected_demanda_id = demanda_options.get(
-                    st.selectbox("Vincular à Demanda", list(demanda_options.keys()), label_visibility="collapsed"))
+                demanda_options = {"Selecione uma Demanda": None, **{f"ID: ...{r['id'][-6:]} - {r['descricao_necessidade'][:40]}...": r['id'] for _, r in df_demandas_abertas.iterrows()}}
+                selected_demanda_id = demanda_options.get(st.selectbox("Vincular à Demanda", list(demanda_options.keys()), label_visibility="collapsed"))
                 if selected_demanda_id:
                     details = df_demandas_abertas[df_demandas_abertas['id'] == selected_demanda_id].iloc[0]
                     with st.container(border=True):
                         st.markdown("##### Detalhes da Demanda Selecionada")
-                        st.text_area(
-                            "Descrição da Necessidade",
-                            value=details['descricao_necessidade'],
-                            height=150,
-                            disabled=True,
-                            help="Descrição completa da demanda original."
-                        )
-
-                        col1, col2 = st.columns(2)
-                        col1.markdown(f"**Categoria:**\n\n`{details['categoria']}`")
-                        col2.markdown(f"**Solicitante da Demanda:**\n\n`{details['solicitante_demanda']}`")
+                        st.text_area("Descrição da Necessidade", value=details['descricao_necessidade'], height=150, disabled=True)
+                        c1, c2, c3 = st.columns(3)
+                        c1.markdown(f"**Tipo:**\n\n`{details.get('tipo', 'N/A')}`")
+                        c2.markdown(f"**Categoria:**\n\n`{details['categoria']}`")
+                        c3.markdown(f"**Solicitante:**\n\n`{details['solicitante_demanda']}`")
 
                     st.subheader("Passo 2: Detalhes da Requisição")
                     with st.form("requisicao_form_details", clear_on_submit=True):
-                        valor, numero_rc = st.number_input("Valor (R$)", min_value=0.01, format="%.2f"), st.text_input(
-                            "Número da RC (opcional)")
+                        valor_str = st.text_input("Valor da Requisição (R$)", placeholder="Ex: 1.234,56")
+                        numero_rc = st.text_input("Número da RC (opcional)")
                         if st.form_submit_button("Registrar Requisição", type="primary"):
                             try:
-                                requisicao = Requisicao(solicitante=st.session_state.username,
-                                                        demanda_id=selected_demanda_id, valor=valor,
-                                                        numero_rc=numero_rc or None)
+                                valor = parse_brazilian_float(valor_str)
+                                if valor <= 0:
+                                    st.error("O valor da requisição deve ser maior que zero.")
+                                    return
+                                requisicao = Requisicao(solicitante=st.session_state.username, demanda_id=selected_demanda_id, valor=valor, numero_rc=numero_rc or None)
                                 req_data = requisicao.model_dump()
-                                req_data['historico'] = [
-                                    f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                                req_data['historico'] = [f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
                                 if self.db.add_doc("requisicoes", req_data):
-                                    self.db.update_doc("demandas", selected_demanda_id,
-                                                       {"status_demanda": "Em Atendimento"}, st.session_state.username)
-                                    st.toast("✅ Requisição registrada!", icon="✅");
-                                    time.sleep(1);
-                                    st.rerun()
-                            except Exception as e:
-                                st.error(f"Erro ao registrar: {e}")
+                                    self.db.update_doc("demandas", selected_demanda_id, {"status_demanda": "Em Atendimento"}, st.session_state.username)
+                                    st.toast("✅ Requisição registrada!", icon="✅"); time.sleep(1); st.rerun()
+                            except ValueError:
+                                return
+                            except Exception as e: st.error(f"Erro ao registrar: {e}")
         st.header("Requisições Registradas")
         df_rc = self.db.get_docs("requisicoes")
-        if not df_rc.empty: st.download_button("📥 Exportar para Excel", to_excel(df_rc, "Relatório de RCs"),
-                                               'relatorio_rcs.xlsx')
+        if not df_rc.empty: st.download_button("📥 Exportar para Excel", to_excel(df_rc, "Relatório de RCs"), 'relatorio_rcs.xlsx')
         self._render_paginated_rows(df_rc, lambda row: self.render_data_row("requisicoes", row), "rcs")
 
     def render_pedidos(self):
@@ -686,69 +619,49 @@ class ViewManager:
         status_map = [['Em Processamento', 'Em Transporte'], ['Entregue'], ['Cancelado']]
         for tab, statuses in zip(tabs, status_map):
             with tab:
-                df_filtered = all_pedidos[
-                    all_pedidos['status'].isin(statuses)] if not all_pedidos.empty else pd.DataFrame()
-                if not df_filtered.empty: st.download_button("📥 Exportar",
-                                                             to_excel(df_filtered, f"Pedidos {statuses[0]}"),
-                                                             f'pedidos_{statuses[0].lower()}.xlsx',
-                                                             key=f'btn_{statuses[0]}')
-                self._render_paginated_rows(df_filtered, lambda row: self.render_data_row("pedidos", row),
-                                            f"pedidos_{statuses[0]}")
+                df_filtered = all_pedidos[all_pedidos['status'].isin(statuses)] if not all_pedidos.empty else pd.DataFrame()
+                if not df_filtered.empty: st.download_button("📥 Exportar", to_excel(df_filtered, f"Pedidos {statuses[0]}"), f'pedidos_{statuses[0].lower()}.xlsx', key=f'btn_{statuses[0]}')
+                self._render_paginated_rows(df_filtered, lambda row: self.render_data_row("pedidos", row), f"pedidos_{statuses[0]}")
 
     def render_data_row(self, collection: str, row: pd.Series):
         key, role = f"{collection}_{row['id']}", st.session_state.role
         with st.container(border=True):
             if collection == 'demandas':
-                title, status = f"Demanda: {row.get('descricao_necessidade', '')} (Cat: {row.get('categoria', 'N/A')})", row.get(
-                    'status_demanda', 'N/A')
+                title = f"Demanda: {row.get('descricao_necessidade', '')} (Tipo: {row.get('tipo', 'N/A')} | Cat: {row.get('categoria', 'N/A')})"
+                status = row.get('status_demanda', 'N/A')
             elif collection == 'requisicoes':
-                title, status = f"RC: {row.get('numero_rc', 'S/N')} | Valor: R$ {row.get('valor', 0):,.2f}", row.get(
-                    'status', 'N/A')
-            else:
-                title, status = f"Pedido: {row.get('numero_pedido', 'S/N')} | Valor: R$ {row.get('valor', 0):,.2f}", row.get(
-                    'status', 'N/A')
-            st.markdown(
-                f"**{title}**\n\n**Status:** `{status}` | **Criado por:** `{row.get('solicitante', row.get('solicitante_demanda', 'N/A'))}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
+                title = f"RC: {row.get('numero_rc', 'S/N')} | Valor: {format_brazilian_currency(row.get('valor', 0))}"
+                status = row.get('status', 'N/A')
+            else: # Pedidos
+                title = f"Pedido: {row.get('numero_pedido', 'S/N')} | Valor: {format_brazilian_currency(row.get('valor', 0))}"
+                status = row.get('status', 'N/A')
+
+            st.markdown(f"**{title}**\n\n**Status:** `{status}` | **Criado por:** `{row.get('solicitante', row.get('solicitante_demanda', 'N/A'))}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
             if collection == 'demandas':
                 anexo_info = row.get('anexo')
                 if anexo_info and isinstance(anexo_info, dict) and 'b64_data' in anexo_info:
                     try:
                         file_bytes = base64.b64decode(anexo_info['b64_data'])
-                        st.download_button(label=f"📥 Baixar anexo: {anexo_info['file_name']}", data=file_bytes,
-                                           file_name=anexo_info['file_name'],
-                                           mime=anexo_info.get('content_type', 'application/octet-stream'),
-                                           key=f"download_{key}")
-                    except Exception as e:
-                        st.error(f"Erro no anexo: {e}")
+                        st.download_button(label=f"📥 Baixar anexo: {anexo_info['file_name']}", data=file_bytes, file_name=anexo_info['file_name'], mime=anexo_info.get('content_type', 'application/octet-stream'), key=f"download_{key}")
+                    except Exception as e: st.error(f"Erro no anexo: {e}")
             if collection == 'pedidos':
-                if pd.notna(row.get('data_entrega')): st.markdown(
-                    f"**Data de Entrega:** `{pd.to_datetime(row.get('data_entrega')).strftime('%d/%m/%Y')}`")
+                if pd.notna(row.get('data_entrega')): st.markdown(f"**Data de Entrega:** `{pd.to_datetime(row.get('data_entrega')).strftime('%d/%m/%Y')}`")
                 if row.get('observacao'): st.markdown(f"**Observação:** *{row.get('observacao')}*")
             cols = st.columns([1, 1, 1, 2, 5])
             if (role == 'admin') or (role == 'user') or (role == 'gestor' and collection == 'demandas'):
-                if cols[0].button("✏️", key=f"edit_{key}", help="Editar"): st.session_state.edit_id = {
-                    'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
-            if role == 'admin' and cols[1].button("🗑️", key=f"del_{key}",
-                                                  help="Excluir"): st.session_state.confirm_delete = {
-                'collection': collection, 'id': row['id'], 'desc': title}; st.rerun()
-            if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"): st.session_state.view_history_id = {
-                'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
+                if cols[0].button("✏️", key=f"edit_{key}", help="Editar"): st.session_state.edit_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
+            if role == 'admin' and cols[1].button("🗑️", key=f"del_{key}", help="Excluir"): st.session_state.confirm_delete = {'collection': collection, 'id': row['id'], 'desc': title}; st.rerun()
+            if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"): st.session_state.view_history_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
             if collection == "requisicoes" and status == "Aberto" and role in ['admin', 'user']:
                 if cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary"):
-                    pedido = Pedido(requisicao_id=row['id'], solicitante=row['solicitante'], valor=row['valor'],
-                                    numero_pedido=f"PED-{row.get('numero_rc', row['id'][-4:])}")
+                    pedido = Pedido(requisicao_id=row['id'], solicitante=row['solicitante'], valor=row['valor'], numero_pedido=f"PED-{row.get('numero_rc', row['id'][-4:])}")
                     pedido_data = pedido.model_dump()
-                    pedido_data['historico'] = [
-                        f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
-                    if self.db.add_doc("pedidos", pedido_data): self.db.update_doc("requisicoes", row['id'],
-                                                                                   {"status": "Pedido Gerado"},
-                                                                                   st.session_state.username); st.toast(
-                        "🚀 Pedido gerado!", icon="🚀"); time.sleep(1); st.rerun()
+                    pedido_data['historico'] = [f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                    if self.db.add_doc("pedidos", pedido_data): self.db.update_doc("requisicoes", row['id'], {"status": "Pedido Gerado"}, st.session_state.username); st.toast("🚀 Pedido gerado!", icon="🚀"); time.sleep(1); st.rerun()
             if st.session_state.confirm_delete.get('id') == row['id']:
                 st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
                 c1, c2, _ = st.columns([1, 1, 8])
-                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"): self.db.delete_doc(collection, row[
-                    'id']); st.session_state.confirm_delete = {}; st.rerun()
+                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"): self.db.delete_doc(collection, row['id']); st.session_state.confirm_delete = {}; st.rerun()
                 if c2.button("Cancelar", key=f"canc_del_{key}"): st.session_state.confirm_delete = {}; st.rerun()
 
     @st.dialog("Histórico de Alterações")
@@ -763,36 +676,52 @@ class ViewManager:
             edit_info = st.session_state.edit_id
             with st.form(key=f"edit_form_{edit_info['id']}"):
                 st.subheader(f"Editando {edit_info['collection'][:-1].capitalize()} ID: ...{edit_info['id'][-6:]}")
-                data, new_data = edit_info['data'], {}
+                data = edit_info['data']
+                new_data = {}
+                valor_str = None
+
                 if edit_info['collection'] == 'demandas':
                     new_data['descricao_necessidade'] = st.text_area("Descrição", data.get('descricao_necessidade', ''))
+                    tipos = ["Material", "Serviço"]
+                    current_tipo = data.get('tipo')
+                    tipo_index = tipos.index(current_tipo) if current_tipo in tipos else 0
+                    new_data['tipo'] = st.selectbox("Tipo", tipos, index=tipo_index)
                     new_data['categoria'] = st.text_input("Categoria", data.get('categoria', ''))
                     opts = ["Aberta", "Em Atendimento", "Fechada", "Cancelada"]
-                    new_data['status_demanda'] = st.selectbox("Status", opts,
-                                                              index=opts.index(data.get('status_demanda')))
+                    new_data['status_demanda'] = st.selectbox("Status", opts, index=opts.index(data.get('status_demanda')))
                 elif edit_info['collection'] == 'requisicoes':
                     new_data['numero_rc'] = st.text_input("Número da RC", data.get('numero_rc', ''))
-                    new_data['valor'] = st.number_input("Valor (R$)", min_value=0.01, value=data.get('valor'),
-                                                        format="%.2f")
+                    current_valor_str = f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.')
+                    valor_str = st.text_input("Valor (R$)", value=current_valor_str)
                     opts = ["Aberto", "Pedido Gerado", "Cancelado"]
                     new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
                 elif edit_info['collection'] == 'pedidos':
                     new_data['numero_pedido'] = st.text_input("Número do Pedido", data.get('numero_pedido', ''))
+                    current_valor_str = f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.')
+                    valor_str = st.text_input("Valor (R$)", value=current_valor_str)
                     opts = ["Em Processamento", "Em Transporte", "Entregue", "Cancelado"]
                     new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
-                    entrega_val = pd.to_datetime(data.get('data_entrega')).date() if pd.notna(
-                        data.get('data_entrega')) else None
+                    entrega_val = pd.to_datetime(data.get('data_entrega')).date() if pd.notna(data.get('data_entrega')) else None
                     data_entrega_input = st.date_input("Data de Entrega", value=entrega_val)
-                    new_data['data_entrega'] = datetime.combine(data_entrega_input,
-                                                                datetime.min.time()) if data_entrega_input else None
+                    new_data['data_entrega'] = datetime.combine(data_entrega_input, datetime.min.time()) if data_entrega_input else None
                     new_data['observacao'] = st.text_area("Observação", data.get('observacao', ''))
+
                 c1, c2 = st.columns(2)
                 if c1.form_submit_button("Salvar", type="primary"):
-                    if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data,
-                                          st.session_state.username): st.toast("💾 Atualizado!",
-                                                                               icon="💾"); st.session_state.edit_id = None; time.sleep(
-                        1); st.rerun()
-                if c2.form_submit_button("Cancelar"): st.session_state.edit_id = None; st.rerun()
+                    try:
+                        if valor_str is not None:
+                            new_data['valor'] = parse_brazilian_float(valor_str)
+                        with st.spinner("Salvando alterações..."):
+                            if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data, st.session_state.username):
+                                st.toast("💾 Atualizado!", icon="💾")
+                                st.session_state.edit_id = None
+                                time.sleep(1)
+                                st.rerun()
+                    except ValueError:
+                        pass
+                if c2.form_submit_button("Cancelar"):
+                    st.session_state.edit_id = None
+                    st.rerun()
 
     def _generate_backup_data(self) -> bytes:
         try:
@@ -800,15 +729,11 @@ class ViewManager:
             for col in ["users", "demandas", "requisicoes", "pedidos"]:
                 docs_df = self.db.get_docs(col)
                 for col_name in docs_df.columns:
-                    if docs_df[col_name].apply(lambda x: isinstance(x, bytes)).any(): docs_df[col_name] = docs_df[
-                        col_name].apply(lambda x: base64.b64encode(x).decode('utf-8') if isinstance(x, bytes) else x)
-                    if pd.api.types.is_datetime64_any_dtype(docs_df[col_name]): docs_df[col_name] = docs_df[
-                        col_name].astype(str)
+                    if docs_df[col_name].apply(lambda x: isinstance(x, bytes)).any(): docs_df[col_name] = docs_df[col_name].apply(lambda x: base64.b64encode(x).decode('utf-8') if isinstance(x, bytes) else x)
+                    if pd.api.types.is_datetime64_any_dtype(docs_df[col_name]): docs_df[col_name] = docs_df[col_name].astype(str)
                 backup_data[col] = docs_df.to_dict(orient='records')
             return json.dumps(backup_data, ensure_ascii=False, indent=4).encode('utf-8')
-        except Exception as e:
-            st.error(f"Erro ao gerar backup: {e}"); return b""
-
+        except Exception as e: st.error(f"Erro ao gerar backup: {e}"); return b""
 
 # -----------------------------------------------------------------------------
 # 4. PONTO DE ENTRADA DA APLICAÇÃO
