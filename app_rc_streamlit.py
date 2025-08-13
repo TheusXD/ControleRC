@@ -604,8 +604,10 @@ class ViewManager:
         doc_data = self.db.get_doc(collection, doc_id)
         if doc_data:
             row = pd.Series(doc_data)
-            # CORREÇÃO: Argumentos na ordem correta
-            self.render_data_row(row, collection=collection)
+            all_demandas = None
+            if collection == 'requisicoes':
+                all_demandas = self.db.get_docs("demandas")
+            self.render_data_row(row, collection=collection, all_demandas=all_demandas)
         else:
             st.error("Item não encontrado.")
 
@@ -647,7 +649,10 @@ class ViewManager:
                 with st.form("demanda_form", clear_on_submit=True):
                     descricao = st.text_area("Descrição da Necessidade")
                     tipo = st.selectbox("Tipo", ["Material", "Serviço"], index=None, placeholder="Selecione o tipo...")
-                    categoria = st.text_input("Categoria")
+                    categorias_fixas = ["Facilities/Eletromecânica", "Manutenção de rede", "Tratamento",
+                                        "Tratamento (Laboratório)"]
+                    categoria = st.selectbox("Categoria", categorias_fixas, index=None,
+                                             placeholder="Selecione a categoria...")
                     uploaded_file = st.file_uploader("Anexo (Opcional, máx 750KB)")
                     if st.form_submit_button("Registrar Demanda", type="primary"):
                         if not descricao or not categoria or not tipo:
@@ -730,9 +735,11 @@ class ViewManager:
                                 st.error(f"Erro ao registrar: {e}")
         st.header("Requisições Registradas")
         df_rc = self.db.get_docs("requisicoes")
+        df_demandas = self.db.get_docs("demandas")
         if not df_rc.empty: st.download_button("📥 Exportar para Excel", to_excel(df_rc, "Relatório de RCs"),
                                                'relatorio_rcs.xlsx')
-        self._render_paginated_rows(df_rc, self.render_data_row, "rcs", collection="requisicoes")
+        self._render_paginated_rows(df_rc, self.render_data_row, "rcs", collection="requisicoes",
+                                    all_demandas=df_demandas)
 
     def render_pedidos(self):
         st.header("Pedidos de Compra")
@@ -750,7 +757,7 @@ class ViewManager:
                 self._render_paginated_rows(df_filtered, self.render_data_row, f"pedidos_{statuses[0]}",
                                             collection="pedidos")
 
-    def render_data_row(self, row: pd.Series, collection: str, all_rcs=None, all_pedidos=None):
+    def render_data_row(self, row: pd.Series, collection: str, all_rcs=None, all_pedidos=None, all_demandas=None):
         key, role = f"{collection}_{row['id']}", st.session_state.role
         with st.container(border=True):
             if collection == 'demandas':
@@ -765,6 +772,16 @@ class ViewManager:
 
             st.markdown(
                 f"**{title}**\n\n**Status:** `{status}` | **Criado por:** `{row.get('solicitante', row.get('solicitante_demanda', 'N/A'))}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
+
+            if collection == 'requisicoes' and pd.notna(row.get('demanda_id')):
+                demanda_id = row['demanda_id']
+                if all_demandas is not None and not all_demandas.empty:
+                    demanda_info = all_demandas[all_demandas['id'] == demanda_id]
+                    if not demanda_info.empty:
+                        descricao = demanda_info.iloc[0]['descricao_necessidade']
+                        with st.expander("Ver Descrição da Demanda Original"):
+                            st.info(descricao)
+
             if collection == 'demandas':
                 anexo_info = row.get('anexo')
                 if anexo_info and isinstance(anexo_info, dict) and 'b64_data' in anexo_info:
@@ -791,7 +808,6 @@ class ViewManager:
             if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"): st.session_state.view_history_id = {
                 'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
 
-            # Botão de atalho para RC/Pedido
             if collection == 'demandas':
                 linked_rc = all_rcs[
                     all_rcs['demanda_id'] == row['id']] if all_rcs is not None and not all_rcs.empty else pd.DataFrame()
@@ -848,7 +864,12 @@ class ViewManager:
                     current_tipo = data.get('tipo')
                     tipo_index = tipos.index(current_tipo) if current_tipo in tipos else 0
                     new_data['tipo'] = st.selectbox("Tipo", tipos, index=tipo_index)
-                    new_data['categoria'] = st.text_input("Categoria", data.get('categoria', ''))
+                    categorias_fixas = ["Facilities/Eletromecânica", "Manutenção de rede", "Tratamento",
+                                        "Tratamento (Laboratório)"]
+                    current_categoria = data.get('categoria')
+                    cat_index = categorias_fixas.index(
+                        current_categoria) if current_categoria in categorias_fixas else 0
+                    new_data['categoria'] = st.selectbox("Categoria", categorias_fixas, index=cat_index)
                     opts = ["Aberta", "Em Atendimento", "Fechada", "Cancelada"]
                     new_data['status_demanda'] = st.selectbox("Status", opts,
                                                               index=opts.index(data.get('status_demanda')))
