@@ -5,3 +5,4 @@ firebase-admin
 pydantic
 plotly
 fpdf
+email-validator

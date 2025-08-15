@@ -18,3 +18,5 @@ __pycache__/
 .Python
 env/
 venv/
+# Ignorar arquivos de ambiente das Cloud Functions
+functions/.env.production
