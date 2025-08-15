@@ -605,9 +605,13 @@ class ViewManager:
         if doc_data:
             row = pd.Series(doc_data)
             all_demandas = None
+            all_rcs = None
             if collection == 'requisicoes':
                 all_demandas = self.db.get_docs("demandas")
-            self.render_data_row(row, collection=collection, all_demandas=all_demandas)
+            if collection == 'pedidos':
+                all_demandas = self.db.get_docs("demandas")
+                all_rcs = self.db.get_docs("requisicoes")
+            self.render_data_row(row, collection=collection, all_demandas=all_demandas, all_rcs=all_rcs)
         else:
             st.error("Item não encontrado.")
 
@@ -616,7 +620,7 @@ class ViewManager:
         df_demandas, df_rc, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs(
             "requisicoes"), self.db.get_docs("pedidos")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
+        c1.metric("Total de Demandas", f"{len(df_demandas)} �")
         c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
         c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
         total_valor_rc = df_rc['valor'].sum() if not df_rc.empty else 0
@@ -678,12 +682,107 @@ class ViewManager:
                                     1); st.rerun()
                             except ValidationError as e:
                                 st.error(f"Erro de validação: {e}")
+
+            with st.expander("➕ Adicionar Múltiplas Demandas (via Planilha)"):
+                self._render_bulk_upload_section()
+
         st.header("Demandas Registradas")
         df_demandas = self.db.get_docs("demandas")
         df_rcs = self.db.get_docs("requisicoes")
         df_pedidos = self.db.get_docs("pedidos")
         self._render_paginated_rows(df_demandas, self.render_data_row, "demandas", collection="demandas",
                                     all_rcs=df_rcs, all_pedidos=df_pedidos)
+
+    def _render_bulk_upload_section(self):
+        """Renderiza a seção de upload de planilhas para criar demandas em massa."""
+        st.info(
+            "Faça o upload de uma planilha Excel (.xlsx) com as colunas: `descricao_necessidade`, `tipo`, `categoria`.")
+
+        # Criar um arquivo modelo em memória para download
+        df_modelo = pd.DataFrame({
+            "descricao_necessidade": ["Exemplo: Compra de 10 capacetes de segurança"],
+            "tipo": ["Material"],
+            "categoria": ["Facilities/Eletromecânica"]
+        })
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_modelo.to_excel(writer, index=False, sheet_name='Modelo')
+
+        st.download_button(
+            label="📥 Baixar Planilha Modelo",
+            data=output.getvalue(),
+            file_name="modelo_demandas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        uploaded_file = st.file_uploader("Selecione a planilha", type="xlsx")
+
+        if uploaded_file:
+            if st.button("Processar Planilha", type="primary"):
+                try:
+                    df = pd.read_excel(uploaded_file)
+                    required_columns = ["descricao_necessidade", "tipo", "categoria"]
+
+                    # Normalizar nomes das colunas (minúsculas, sem espaços)
+                    df.columns = [col.lower().replace(" ", "_") for col in df.columns]
+
+                    if not all(col in df.columns for col in required_columns):
+                        st.error(f"A planilha deve conter as colunas: {', '.join(required_columns)}")
+                        return
+
+                    success_count = 0
+                    error_list = []
+                    total_rows = len(df)
+                    progress_bar = st.progress(0, text="Processando demandas...")
+
+                    tipos_validos = ["Material", "Serviço"]
+                    categorias_validas = ["Facilities/Eletromecânica", "Manutenção de rede", "Tratamento",
+                                          "Tratamento (Laboratório)"]
+
+                    for index, row in df.iterrows():
+                        try:
+                            descricao = row['descricao_necessidade']
+                            tipo = row['tipo']
+                            categoria = row['categoria']
+
+                            if not (descricao and tipo and categoria):
+                                raise ValueError("Linha com dados obrigatórios em branco.")
+                            if tipo not in tipos_validos:
+                                raise ValueError(f"Tipo '{tipo}' inválido. Use 'Material' ou 'Serviço'.")
+                            if categoria not in categorias_validas:
+                                raise ValueError(f"Categoria '{categoria}' inválida.")
+
+                            demanda = Demanda(
+                                solicitante_demanda=st.session_state.username,
+                                descricao_necessidade=str(descricao),
+                                tipo=str(tipo),
+                                categoria=str(categoria)
+                            )
+                            demanda_data = demanda.model_dump()
+                            demanda_data['historico'] = [
+                                f"Criado por {st.session_state.username} via upload em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+
+                            if self.db.add_doc("demandas", demanda_data):
+                                success_count += 1
+                            else:
+                                raise Exception("Falha ao salvar no banco de dados.")
+
+                        except Exception as e:
+                            error_list.append(f"Linha {index + 2}: {e} | Dados: {row.to_dict()}")
+
+                        progress_bar.progress((index + 1) / total_rows, text=f"Processando {index + 1}/{total_rows}")
+
+                    st.success(f"{success_count} de {total_rows} demandas foram registradas com sucesso!")
+                    if error_list:
+                        st.error("Algumas linhas não puderam ser processadas:")
+                        for error in error_list:
+                            st.write(error)
+
+                    time.sleep(3)
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Ocorreu um erro ao processar o arquivo: {e}")
 
     def render_requisicoes(self):
         st.header("Requisições de Compra (RCs)")
@@ -744,6 +843,8 @@ class ViewManager:
     def render_pedidos(self):
         st.header("Pedidos de Compra")
         all_pedidos = self.db.get_docs("pedidos")
+        all_rcs = self.db.get_docs("requisicoes")
+        all_demandas = self.db.get_docs("demandas")
         tabs = st.tabs(["⏳ Em Andamento", "✅ Entregues", "❌ Cancelados"])
         status_map = [['Em Processamento', 'Em Transporte'], ['Entregue'], ['Cancelado']]
         for tab, statuses in zip(tabs, status_map):
@@ -755,7 +856,7 @@ class ViewManager:
                                                              f'pedidos_{statuses[0].lower()}.xlsx',
                                                              key=f'btn_{statuses[0]}')
                 self._render_paginated_rows(df_filtered, self.render_data_row, f"pedidos_{statuses[0]}",
-                                            collection="pedidos")
+                                            collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas)
 
     def render_data_row(self, row: pd.Series, collection: str, all_rcs=None, all_pedidos=None, all_demandas=None):
         key, role = f"{collection}_{row['id']}", st.session_state.role
@@ -781,6 +882,19 @@ class ViewManager:
                         descricao = demanda_info.iloc[0]['descricao_necessidade']
                         with st.expander("Ver Descrição da Demanda Original"):
                             st.info(descricao)
+
+            if collection == 'pedidos' and pd.notna(row.get('requisicao_id')):
+                requisicao_id = row['requisicao_id']
+                if all_rcs is not None and not all_rcs.empty:
+                    rc_info = all_rcs[all_rcs['id'] == requisicao_id]
+                    if not rc_info.empty:
+                        demanda_id = rc_info.iloc[0].get('demanda_id')
+                        if demanda_id and all_demandas is not None and not all_demandas.empty:
+                            demanda_info = all_demandas[all_demandas['id'] == demanda_id]
+                            if not demanda_info.empty:
+                                descricao = demanda_info.iloc[0]['descricao_necessidade']
+                                with st.expander("Ver Descrição da Demanda Original"):
+                                    st.info(descricao)
 
             if collection == 'demandas':
                 anexo_info = row.get('anexo')
