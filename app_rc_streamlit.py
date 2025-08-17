@@ -93,6 +93,19 @@ class FirebaseService:
         self.db = firestore.client()
         logger.info("Firebase Service inicializado.")
 
+    def log_action(self, action: str, username: str, details: Optional[Dict] = None):
+        """Registra uma ação do usuário no log de auditoria."""
+        try:
+            log_data = {
+                "timestamp": datetime.now(),
+                "action": action,
+                "username": username,
+                "details": details or {}
+            }
+            self.db.collection("audit_logs").add(log_data)
+        except Exception as e:
+            logger.error(f"Falha ao registrar ação no log de auditoria: {e}", exc_info=True)
+
     def get_doc(self, collection: str, doc_id: str) -> Optional[Dict[str, Any]]:
         try:
             doc = self.db.collection(collection).document(doc_id).get()
@@ -111,10 +124,16 @@ class FirebaseService:
             if filters:
                 for f in filters:
                     query = query.where(filter=firestore.FieldFilter(f[0], f[1], f[2]))
+
+            # Para logs, ordenar por timestamp
+            if collection == "audit_logs":
+                query = query.order_by("timestamp", direction=firestore.Query.DESCENDING)
+
             docs = query.stream()
             data = [doc.to_dict() | {'id': doc.id} for doc in docs]
             df = pd.DataFrame(data) if data else pd.DataFrame()
-            if 'created_at' in df.columns:
+
+            if 'created_at' in df.columns and collection != "audit_logs":
                 df['created_at'] = pd.to_datetime(df['created_at'])
                 df = df.sort_values(by='created_at', ascending=False)
             return df
@@ -216,6 +235,7 @@ class AuthService:
             user_data = User(username=username, email=email, role=role, status=status).model_dump()
             user_data.update({"password": hashed_pw, "salt": salt})
             if self.db.add_doc("users", user_data):
+                self.db.log_action("User Registered", username, {"email": email, "role": role})
                 st.success(f"Usuário '{username}' registrado como '{role}'. Status: {status}")
                 time.sleep(2);
                 st.session_state.page = "Login";
@@ -234,6 +254,7 @@ class AuthService:
                 st.session_state.username = user_data['username']
                 st.session_state.role = user_data['role']
                 st.session_state.last_activity = time.time()
+                self.db.log_action("User Login", username)
                 st.rerun()
             else:
                 st.error("Usuário ou senha incorretos.")
@@ -243,6 +264,7 @@ class AuthService:
     def check_session_timeout(self):
         if 'last_activity' in st.session_state:
             if time.time() - st.session_state.last_activity > self.SESSION_TIMEOUT_MINUTES * 60:
+                self.db.log_action("Session Timeout", st.session_state.get('username', 'unknown'))
                 for key in list(st.session_state.keys()): del st.session_state[key]
                 st.warning("Sessão expirada. Faça login novamente.");
                 time.sleep(3);
@@ -381,16 +403,22 @@ class ViewManager:
         if st.session_state.focus_item:
             self.render_focused_view()
         else:
-            tab_dashboard, tab_demandas, tab_rcs, tab_pedidos = st.tabs(
-                ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"])
-            with tab_dashboard:
+            tabs = ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"]
+            if st.session_state.role == 'admin':
+                tabs.append("🛡️ Registros de Atividades")
+
+            selected_tabs = st.tabs(tabs)
+
+            with selected_tabs[0]:
                 self.render_dashboard()
-            with tab_demandas:
+            with selected_tabs[1]:
                 self.render_demandas()
-            with tab_rcs:
+            with selected_tabs[2]:
                 self.render_requisicoes()
-            with tab_pedidos:
+            with selected_tabs[3]:
                 self.render_pedidos()
+            if st.session_state.role == 'admin':
+                with selected_tabs[4]: self.render_logs_tab()
 
     def render_sidebar(self):
         with st.sidebar:
@@ -406,10 +434,12 @@ class ViewManager:
                             st.error("As novas senhas não coincidem.")
                         else:
                             if self.auth.change_password(st.session_state.username, old_p, new_p):
+                                self.db.log_action("Password Changed", st.session_state.username)
                                 time.sleep(2)
                                 st.rerun()
 
             if st.button("Logout", use_container_width=True):
+                self.db.log_action("User Logout", st.session_state.username)
                 for key in list(st.session_state.keys()): del st.session_state[key]
                 st.rerun()
             st.divider()
@@ -424,9 +454,14 @@ class ViewManager:
                 self._render_user_lists()
         st.divider()
         st.subheader("Backup e Restauro Local")
-        st.download_button(label="📥 Baixar Backup Local", data=self._generate_backup_data(),
-                           file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json",
-                           use_container_width=True, type="primary")
+
+        # Botão de Backup
+        if st.download_button(label="📥 Baixar Backup Local", data=self._generate_backup_data(),
+                              file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                              mime="application/json", use_container_width=True, type="primary"):
+            self.db.log_action("Backup Downloaded", st.session_state.username)
+
+        # Seção de Restauro
         uploaded_file = st.file_uploader("Restaurar a partir de arquivo (.json)", type="json")
         if uploaded_file:
             if st.button("Restaurar Backup"): st.session_state.confirm_restore = uploaded_file; st.rerun()
@@ -434,6 +469,8 @@ class ViewManager:
             st.error(f"Restaurar '{st.session_state.confirm_restore.name}'? Dados atuais serão perdidos.")
             rc1, rc2, _ = st.columns([1, 1, 3])
             if rc1.button("Sim, restaurar", key="conf_restore_l", type="primary"):
+                self.db.log_action("Backup Restored", st.session_state.username,
+                                   {"file_name": st.session_state.confirm_restore.name})
                 if self.db.restore_from_backup_data(json.load(st.session_state.confirm_restore)): st.success(
                     "Backup restaurado!"); del st.session_state.confirm_restore; time.sleep(2); st.rerun()
             if rc2.button("Cancelar", key="canc_restore_l"): del st.session_state.confirm_restore; st.rerun()
@@ -445,11 +482,14 @@ class ViewManager:
             for _, user in pending_users.iterrows():
                 c1, c2, c3 = st.columns([2, 1, 1])
                 c1.write(f"{user['username']} ({user['role']})")
-                if c2.button("✅", key=f"a_{user['id']}", help="Aprovar"): self.db.update_doc("users", user['id'],
-                                                                                             {"status": "active"},
-                                                                                             st.session_state.username); st.rerun()
-                if c3.button("🗑️", key=f"r_{user['id']}", help="Rejeitar"): self.db.delete_doc("users",
-                                                                                               user['id']); st.rerun()
+                if c2.button("✅", key=f"a_{user['id']}", help="Aprovar"):
+                    self.db.update_doc("users", user['id'], {"status": "active"}, st.session_state.username)
+                    self.db.log_action("User Approved", st.session_state.username, {"approved_user": user['username']})
+                    st.rerun()
+                if c3.button("🗑️", key=f"r_{user['id']}", help="Rejeitar"):
+                    self.db.delete_doc("users", user['id'])
+                    self.db.log_action("User Rejected", st.session_state.username, {"rejected_user": user['username']})
+                    st.rerun()
             st.divider()
 
         st.subheader("Usuários Ativos")
@@ -480,15 +520,15 @@ class ViewManager:
             c1, c2 = st.columns(2)
             if c1.form_submit_button("Salvar Alterações", type="primary"):
                 try:
-                    # Valida o e-mail criando uma instância temporária do modelo
                     User(username=user_data['username'], email=email, role=role,
                          status=user_data.get('status', 'active'))
-
                     update_data = {"email": email, "role": role}
                     if self.db.update_doc("users", user_data['id'], update_data, st.session_state.username):
+                        self.db.log_action("User Edited", st.session_state.username,
+                                           {"target_user": user_data['username'], "changes": update_data})
                         st.success("Usuário atualizado com sucesso!")
                         st.session_state.edit_user_id = None
-                        time.sleep(1)
+                        time.sleep(1);
                         st.rerun()
                 except ValidationError as e:
                     st.error(f"E-mail inválido: {e.errors()[0]['msg']}")
@@ -563,7 +603,7 @@ class ViewManager:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
         c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
-        c3.metric("Total de Pedidos", f"{len(df_pedidos)} �")
+        c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
         total_valor_rc = df_rc['valor'].sum() if not df_rc.empty else 0
         c4.metric("Valor Total em RCs", format_brazilian_currency(total_valor_rc))
         st.divider()
@@ -618,9 +658,12 @@ class ViewManager:
                                 demanda_data = demanda.model_dump()
                                 demanda_data['historico'] = [
                                     f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
-                                if self.db.add_doc("demandas", demanda_data): st.toast("✅ Demanda registrada!",
-                                                                                       icon="✅"); time.sleep(
-                                    1); st.rerun()
+                                if self.db.add_doc("demandas", demanda_data):
+                                    self.db.log_action("Demanda Created", st.session_state.username,
+                                                       {"description": descricao})
+                                    st.toast("✅ Demanda registrada!", icon="✅");
+                                    time.sleep(1);
+                                    st.rerun()
                             except ValidationError as e:
                                 st.error(f"Erro de validação: {e}")
 
@@ -680,6 +723,9 @@ class ViewManager:
                         error_list.append(f"Linha {index + 2}: {e} | Dados: {row.to_dict()}")
                     progress_bar.progress((index + 1) / total_rows, text=f"Processando {index + 1}/{total_rows}")
 
+                self.db.log_action("Bulk Demanda Upload", st.session_state.username,
+                                   {"file_name": uploaded_file.name, "success_count": success_count,
+                                    "error_count": len(error_list)})
                 st.success(f"{success_count} de {total_rows} demandas registradas!")
                 if error_list:
                     st.error("Algumas linhas não puderam ser processadas:");
@@ -728,6 +774,8 @@ class ViewManager:
                                 if self.db.add_doc("requisicoes", req_data):
                                     self.db.update_doc("demandas", selected_demanda_id,
                                                        {"status_demanda": "Em Atendimento"}, st.session_state.username)
+                                    self.db.log_action("Requisicao Created", st.session_state.username,
+                                                       {"demanda_id": selected_demanda_id, "valor": valor})
                                     st.toast("✅ Requisição registrada!", icon="✅");
                                     time.sleep(1);
                                     st.rerun()
@@ -825,8 +873,12 @@ class ViewManager:
             if st.session_state.confirm_delete.get('id') == row['id']:
                 st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
                 c1, c2, _ = st.columns([1, 1, 8])
-                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"): self.db.delete_doc(collection, row[
-                    'id']); st.session_state.confirm_delete = {}; st.rerun()
+                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
+                    self.db.delete_doc(collection, row['id'])
+                    self.db.log_action(f"{collection[:-1].capitalize()} Deleted", st.session_state.username,
+                                       {"doc_id": row['id'], "description": title})
+                    st.session_state.confirm_delete = {};
+                    st.rerun()
                 if c2.button("Cancelar", key=f"canc_del_{key}"): st.session_state.confirm_delete = {}; st.rerun()
 
     @st.dialog("Histórico de Alterações")
@@ -861,6 +913,8 @@ class ViewManager:
                         if self.db.add_doc("pedidos", pedido_data):
                             self.db.update_doc("requisicoes", rc_data['id'], {"status": "Pedido Gerado"},
                                                st.session_state.username)
+                            self.db.log_action("Pedido Created", st.session_state.username,
+                                               {"rc_id": rc_data['id'], "numero_pedido": numero_pedido})
                             st.toast("Pedido gerado!", icon="🚀")
                             st.session_state.generate_pedido_from_rc = None
                             time.sleep(1)
@@ -917,6 +971,10 @@ class ViewManager:
                         if valor_str is not None: new_data['valor'] = parse_brazilian_float(valor_str)
                         if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data,
                                               st.session_state.username):
+                            self.db.log_action(f"{edit_info['collection'][:-1].capitalize()} Updated",
+                                               st.session_state.username, {"doc_id": edit_info['id'],
+                                                                           "changes": {k: v for k, v in new_data.items()
+                                                                                       if k != 'historico'}})
                             st.toast("Atualizado!", icon="💾");
                             st.session_state.edit_id = None;
                             time.sleep(1);
@@ -939,6 +997,43 @@ class ViewManager:
             return json.dumps(backup_data, ensure_ascii=False, indent=4).encode('utf-8')
         except Exception as e:
             st.error(f"Erro ao gerar backup: {e}"); return b""
+
+    def render_logs_tab(self):
+        st.header("🛡️ Registros de Atividades do Sistema")
+
+        logs_df = self.db.get_docs("audit_logs")
+
+        if logs_df.empty:
+            st.info("Nenhum registro de atividade encontrado.")
+            return
+
+        # Filtros
+        col1, col2 = st.columns(2)
+        with col1:
+            users = ["Todos"] + sorted(logs_df['username'].unique().tolist())
+            selected_user = st.selectbox("Filtrar por Usuário", users)
+        with col2:
+            actions = ["Todas"] + sorted(logs_df['action'].unique().tolist())
+            selected_action = st.selectbox("Filtrar por Ação", actions)
+
+        # Aplicar filtros
+        filtered_df = logs_df.copy()
+        if selected_user != "Todos":
+            filtered_df = filtered_df[filtered_df['username'] == selected_user]
+        if selected_action != "Todas":
+            filtered_df = filtered_df[filtered_df['action'] == selected_action]
+
+        st.dataframe(
+            filtered_df[['timestamp', 'username', 'action', 'details']],
+            use_container_width=True,
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Data e Hora", format="DD/MM/YYYY - HH:mm:ss"),
+                "username": "Usuário",
+                "action": "Ação",
+                "details": "Detalhes"
+            },
+            hide_index=True
+        )
 
 
 # -----------------------------------------------------------------------------
