@@ -64,6 +64,7 @@ class Pedido(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     observacao: Optional[str] = None
     data_entrega: Optional[datetime] = None
+    email_notificacao: Optional[EmailStr] = None
     historico: List[str] = []
 
 
@@ -394,8 +395,19 @@ class ViewManager:
     def render_sidebar(self):
         with st.sidebar:
             st.write(f"👤 **{st.session_state.username}** ({st.session_state.role})")
-            with st.expander("Meu Perfil"):
-                st.info("Funcionalidades de perfil do usuário em desenvolvimento.")
+            with st.expander("Meu Perfil", expanded=True):
+                with st.form("change_password_form", clear_on_submit=True):
+                    st.subheader("Alterar Senha")
+                    old_p = st.text_input("Senha Antiga", type="password")
+                    new_p = st.text_input("Nova Senha", type="password")
+                    conf_p = st.text_input("Confirmar Nova Senha", type="password")
+                    if st.form_submit_button("Alterar Senha", type="primary"):
+                        if new_p != conf_p:
+                            st.error("As novas senhas não coincidem.")
+                        else:
+                            if self.auth.change_password(st.session_state.username, old_p, new_p):
+                                time.sleep(2)
+                                st.rerun()
 
             if st.button("Logout", use_container_width=True):
                 for key in list(st.session_state.keys()): del st.session_state[key]
@@ -412,7 +424,19 @@ class ViewManager:
                 self._render_user_lists()
         st.divider()
         st.subheader("Backup e Restauro Local")
-        # ... (código de backup)
+        st.download_button(label="📥 Baixar Backup Local", data=self._generate_backup_data(),
+                           file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json",
+                           use_container_width=True, type="primary")
+        uploaded_file = st.file_uploader("Restaurar a partir de arquivo (.json)", type="json")
+        if uploaded_file:
+            if st.button("Restaurar Backup"): st.session_state.confirm_restore = uploaded_file; st.rerun()
+        if st.session_state.get('confirm_restore'):
+            st.error(f"Restaurar '{st.session_state.confirm_restore.name}'? Dados atuais serão perdidos.")
+            rc1, rc2, _ = st.columns([1, 1, 3])
+            if rc1.button("Sim, restaurar", key="conf_restore_l", type="primary"):
+                if self.db.restore_from_backup_data(json.load(st.session_state.confirm_restore)): st.success(
+                    "Backup restaurado!"); del st.session_state.confirm_restore; time.sleep(2); st.rerun()
+            if rc2.button("Cancelar", key="canc_restore_l"): del st.session_state.confirm_restore; st.rerun()
 
     def _render_user_lists(self):
         pending_users = self.db.get_docs("users", [("status", "==", "pending")])
@@ -539,7 +563,7 @@ class ViewManager:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
         c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
-        c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
+        c3.metric("Total de Pedidos", f"{len(df_pedidos)} �")
         total_valor_rc = df_rc['valor'].sum() if not df_rc.empty else 0
         c4.metric("Valor Total em RCs", format_brazilian_currency(total_valor_rc))
         st.divider()
@@ -820,20 +844,30 @@ class ViewManager:
         with st.form("generate_pedido_form"):
             default_pedido_num = f"PED-{rc_data.get('numero_rc', rc_data['id'][-4:])}"
             numero_pedido = st.text_input("Número do Pedido", value=default_pedido_num)
+            email_notificacao = st.text_input("E-mail para Notificação (opcional)")
             if st.form_submit_button("Confirmar", type="primary"):
                 with st.spinner("Gerando pedido..."):
-                    pedido = Pedido(requisicao_id=rc_data['id'], solicitante=rc_data['solicitante'],
-                                    valor=rc_data['valor'], numero_pedido=numero_pedido)
-                    pedido_data = pedido.model_dump()
-                    pedido_data['historico'] = [
-                        f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
-                    if self.db.add_doc("pedidos", pedido_data):
-                        self.db.update_doc("requisicoes", rc_data['id'], {"status": "Pedido Gerado"},
-                                           st.session_state.username)
-                        st.toast("Pedido gerado!", icon="🚀")
-                        st.session_state.generate_pedido_from_rc = None
-                        time.sleep(1)
-                        st.rerun()
+                    try:
+                        pedido = Pedido(
+                            requisicao_id=rc_data['id'],
+                            solicitante=rc_data['solicitante'],
+                            valor=rc_data['valor'],
+                            numero_pedido=numero_pedido,
+                            email_notificacao=email_notificacao if email_notificacao else None
+                        )
+                        pedido_data = pedido.model_dump()
+                        pedido_data['historico'] = [
+                            f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+                        if self.db.add_doc("pedidos", pedido_data):
+                            self.db.update_doc("requisicoes", rc_data['id'], {"status": "Pedido Gerado"},
+                                               st.session_state.username)
+                            st.toast("Pedido gerado!", icon="🚀")
+                            st.session_state.generate_pedido_from_rc = None
+                            time.sleep(1)
+                            st.rerun()
+                    except ValidationError as e:
+                        st.error(f"E-mail inválido: {e.errors()[0]['msg']}")
+
         if st.button("Cancelar"):
             st.session_state.generate_pedido_from_rc = None
             st.rerun()
