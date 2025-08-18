@@ -125,7 +125,6 @@ class FirebaseService:
                 for f in filters:
                     query = query.where(filter=firestore.FieldFilter(f[0], f[1], f[2]))
 
-            # Para logs, ordenar por timestamp
             if collection == "audit_logs":
                 query = query.order_by("timestamp", direction=firestore.Query.DESCENDING)
 
@@ -455,13 +454,11 @@ class ViewManager:
         st.divider()
         st.subheader("Backup e Restauro Local")
 
-        # Botão de Backup
         if st.download_button(label="📥 Baixar Backup Local", data=self._generate_backup_data(),
                               file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                               mime="application/json", use_container_width=True, type="primary"):
             self.db.log_action("Backup Downloaded", st.session_state.username)
 
-        # Seção de Restauro
         uploaded_file = st.file_uploader("Restaurar a partir de arquivo (.json)", type="json")
         if uploaded_file:
             if st.button("Restaurar Backup"): st.session_state.confirm_restore = uploaded_file; st.rerun()
@@ -522,13 +519,14 @@ class ViewManager:
                 try:
                     User(username=user_data['username'], email=email, role=role,
                          status=user_data.get('status', 'active'))
+
                     update_data = {"email": email, "role": role}
                     if self.db.update_doc("users", user_data['id'], update_data, st.session_state.username):
                         self.db.log_action("User Edited", st.session_state.username,
                                            {"target_user": user_data['username'], "changes": update_data})
                         st.success("Usuário atualizado com sucesso!")
                         st.session_state.edit_user_id = None
-                        time.sleep(1);
+                        time.sleep(1)
                         st.rerun()
                 except ValidationError as e:
                     st.error(f"E-mail inválido: {e.errors()[0]['msg']}")
@@ -756,6 +754,19 @@ class ViewManager:
                         c1.markdown(f"**Tipo:**\n\n`{details.get('tipo', 'N/A')}`")
                         c2.markdown(f"**Categoria:**\n\n`{details['categoria']}`")
                         c3.markdown(f"**Solicitante:**\n\n`{details['solicitante_demanda']}`")
+
+                        anexo_info = details.get('anexo')
+                        if anexo_info and isinstance(anexo_info, dict) and 'b64_data' in anexo_info:
+                            try:
+                                file_bytes = base64.b64decode(anexo_info['b64_data'])
+                                st.download_button(
+                                    label=f"📥 Baixar anexo original: {anexo_info['file_name']}",
+                                    data=file_bytes,
+                                    file_name=anexo_info['file_name'],
+                                    mime=anexo_info.get('content_type', 'application/octet-stream')
+                                )
+                            except Exception as e:
+                                st.error(f"Não foi possível carregar o anexo: {e}")
 
                     st.subheader("Passo 2: Detalhes da Requisição")
                     with st.form("requisicao_form_details", clear_on_submit=True):
@@ -1007,7 +1018,6 @@ class ViewManager:
             st.info("Nenhum registro de atividade encontrado.")
             return
 
-        # Filtros
         col1, col2 = st.columns(2)
         with col1:
             users = ["Todos"] + sorted(logs_df['username'].unique().tolist())
@@ -1016,7 +1026,6 @@ class ViewManager:
             actions = ["Todas"] + sorted(logs_df['action'].unique().tolist())
             selected_action = st.selectbox("Filtrar por Ação", actions)
 
-        # Aplicar filtros
         filtered_df = logs_df.copy()
         if selected_user != "Todos":
             filtered_df = filtered_df[filtered_df['username'] == selected_user]
