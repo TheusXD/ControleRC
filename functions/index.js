@@ -37,20 +37,27 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
     }
     const novoPedido = snap.data();
 
-    // --- LÓGICA ATUALIZADA ---
-    // 1. Verifica se um e-mail de notificação foi fornecido no pedido.
-    const emailDestino = novoPedido.email_notificacao;
+    // --- LÓGICA ATUALIZADA PARA MÚLTIPLOS E-MAILS ---
+    const emailsString = novoPedido.email_notificacao;
 
-    if (!emailDestino) {
+    if (!emailsString || emailsString.trim() === "") {
         logger.log(`Nenhum e-mail de notificação fornecido para o pedido ${novoPedido.numero_pedido}. A função será encerrada.`);
-        return; // Encerra a função se não houver e-mail.
+        return;
+    }
+
+    // Separa a string de e-mails em uma lista, removendo espaços em branco
+    const emailList = emailsString.split(',').map(email => email.trim()).filter(email => email);
+
+    if (emailList.length === 0) {
+        logger.log("A lista de e-mails está vazia após o processamento.");
+        return;
     }
 
     const numeroPedido = novoPedido.numero_pedido || "Sem Número";
     const valorPedido = novoPedido.valor.toFixed(2).replace(".", ",");
 
     try {
-        // 2. Busca a Requisição (RC) para obter a descrição da demanda original.
+        // Busca a Requisição (RC) para obter a descrição da demanda original.
         const requisicaoDoc = await getFirestore()
             .collection("requisicoes")
             .doc(novoPedido.requisicao_id)
@@ -62,7 +69,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         const requisicaoData = requisicaoDoc.data();
         const demandaId = requisicaoData.demanda_id;
 
-        // 3. Busca a Demanda original para obter a descrição.
+        // Busca a Demanda original para obter a descrição.
         const demandaDoc = await getFirestore()
             .collection("demandas")
             .doc(demandaId)
@@ -76,10 +83,10 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         const solicitanteUsername = demandaData.solicitante_demanda;
 
 
-        // 4. Montar e enviar o e-mail de notificação para o endereço fornecido.
+        // Montar e enviar o e-mail de notificação para a lista de endereços.
         const mailOptions = {
             from: `"Sistema de Compras" <${gmailEmail}>`,
-            to: emailDestino,
+            to: emailList.join(", "), // Nodemailer aceita uma string de e-mails separados por vírgula
             subject: `✅ Novo Pedido Gerado: ${numeroPedido}`,
             html: `
             <p>Olá!</p>
@@ -100,7 +107,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         };
 
         await mailTransport.sendMail(mailOptions);
-        logger.log(`Notificação enviada com sucesso para ${emailDestino}`);
+        logger.log(`Notificação enviada com sucesso para: ${emailList.join(", ")}`);
 
     } catch (error) {
         logger.error("Erro ao enviar notificação por e-mail:", error);

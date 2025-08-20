@@ -64,7 +64,7 @@ class Pedido(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     observacao: Optional[str] = None
     data_entrega: Optional[datetime] = None
-    email_notificacao: Optional[EmailStr] = None
+    email_notificacao: Optional[str] = None  # Alterado para string para aceitar múltiplos e-mails
     historico: List[str] = []
 
 
@@ -907,7 +907,8 @@ class ViewManager:
         with st.form("generate_pedido_form"):
             default_pedido_num = f"PED-{rc_data.get('numero_rc', rc_data['id'][-4:])}"
             numero_pedido = st.text_input("Número do Pedido", value=default_pedido_num)
-            email_notificacao = st.text_input("E-mail para Notificação (opcional)")
+            email_notificacao = st.text_area("E-mails para Notificação (opcional)",
+                                             placeholder="Separe múltiplos e-mails por vírgula")
             if st.form_submit_button("Confirmar", type="primary"):
                 with st.spinner("Gerando pedido..."):
                     try:
