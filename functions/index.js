@@ -37,7 +37,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
     }
     const novoPedido = snap.data();
 
-    // --- LÓGICA ATUALIZADA PARA MÚLTIPLOS E-MAILS ---
+    // --- LÓGICA ATUALIZADA PARA MÚLTIPLOS E-MAILS E ANEXOS ---
     const emailsString = novoPedido.email_notificacao;
 
     if (!emailsString || emailsString.trim() === "") {
@@ -57,11 +57,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
     const valorPedido = novoPedido.valor.toFixed(2).replace(".", ",");
 
     try {
-        // Busca a Requisição (RC) para obter a descrição da demanda original.
-        const requisicaoDoc = await getFirestore()
-            .collection("requisicoes")
-            .doc(novoPedido.requisicao_id)
-            .get();
+        const requisicaoDoc = await getFirestore().collection("requisicoes").doc(novoPedido.requisicao_id).get();
         if (!requisicaoDoc.exists) {
             logger.log(`Requisição com ID ${novoPedido.requisicao_id} não encontrada.`);
             return;
@@ -69,11 +65,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         const requisicaoData = requisicaoDoc.data();
         const demandaId = requisicaoData.demanda_id;
 
-        // Busca a Demanda original para obter a descrição.
-        const demandaDoc = await getFirestore()
-            .collection("demandas")
-            .doc(demandaId)
-            .get();
+        const demandaDoc = await getFirestore().collection("demandas").doc(demandaId).get();
         if (!demandaDoc.exists) {
             logger.log(`Demanda com ID ${demandaId} não encontrada.`);
             return;
@@ -82,8 +74,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         const descricaoDemanda = demandaData.descricao_necessidade;
         const solicitanteUsername = demandaData.solicitante_demanda;
 
-
-        // Montar e enviar o e-mail de notificação para a lista de endereços.
+        // Montar o objeto de opções do e-mail
         const mailOptions = {
             from: `"Sistema de Compras" <${gmailEmail}>`,
             to: emailList.join(", "), // Nodemailer aceita uma string de e-mails separados por vírgula
@@ -104,7 +95,18 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
             <p>Você pode acompanhar o status do pedido através do sistema.</p>
             <p><em>Esta é uma mensagem automática, por favor, não responda.</em></p>
           `,
+          attachments: [] // Inicializa a lista de anexos
         };
+
+        // Adicionar anexo ao e-mail, se existir
+        if (novoPedido.anexo_email && novoPedido.anexo_email.b64_data) {
+            mailOptions.attachments.push({
+                filename: novoPedido.anexo_email.file_name,
+                content: Buffer.from(novoPedido.anexo_email.b64_data, 'base64'),
+                contentType: novoPedido.anexo_email.content_type,
+            });
+            logger.log(`Anexando arquivo ${novoPedido.anexo_email.file_name} ao e-mail.`);
+        }
 
         await mailTransport.sendMail(mailOptions);
         logger.log(`Notificação enviada com sucesso para: ${emailList.join(", ")}`);

@@ -64,7 +64,8 @@ class Pedido(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     observacao: Optional[str] = None
     data_entrega: Optional[datetime] = None
-    email_notificacao: Optional[str] = None  # Alterado para string para aceitar múltiplos e-mails
+    email_notificacao: Optional[str] = None
+    anexo_email: Optional[Dict[str, str]] = None  # Novo campo para o anexo do e-mail
     historico: List[str] = []
 
 
@@ -909,15 +910,27 @@ class ViewManager:
             numero_pedido = st.text_input("Número do Pedido", value=default_pedido_num)
             email_notificacao = st.text_area("E-mails para Notificação (opcional)",
                                              placeholder="Separe múltiplos e-mails por vírgula")
+            anexo_email_file = st.file_uploader("Anexo para o E-mail (opcional)")
+
             if st.form_submit_button("Confirmar", type="primary"):
                 with st.spinner("Gerando pedido..."):
+                    anexo_email_data = None
+                    if anexo_email_file:
+                        b64_data = base64.b64encode(anexo_email_file.getvalue()).decode('utf-8')
+                        anexo_email_data = {
+                            "file_name": anexo_email_file.name,
+                            "content_type": anexo_email_file.type,
+                            "b64_data": b64_data
+                        }
+
                     try:
                         pedido = Pedido(
                             requisicao_id=rc_data['id'],
                             solicitante=rc_data['solicitante'],
                             valor=rc_data['valor'],
                             numero_pedido=numero_pedido,
-                            email_notificacao=email_notificacao if email_notificacao else None
+                            email_notificacao=email_notificacao if email_notificacao else None,
+                            anexo_email=anexo_email_data
                         )
                         pedido_data = pedido.model_dump()
                         pedido_data['historico'] = [
