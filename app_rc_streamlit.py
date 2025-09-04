@@ -17,6 +17,7 @@ import re
 import logging
 import json
 import base64
+import uuid
 
 # Configurar o logging para monitorizar a aplicação
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,6 +42,7 @@ class Demanda(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     closed_at: Optional[datetime] = None
     historico: List[str] = []
+    comentarios: List[Dict[str, Any]] = []
 
 
 class Requisicao(BaseModel):
@@ -52,6 +54,7 @@ class Requisicao(BaseModel):
     status: str = "Aberto"
     created_at: datetime = Field(default_factory=datetime.now)
     historico: List[str] = []
+    comentarios: List[Dict[str, Any]] = []
 
 
 class Pedido(BaseModel):
@@ -67,6 +70,7 @@ class Pedido(BaseModel):
     email_notificacao: Optional[str] = None
     anexo_email: Optional[Dict[str, str]] = None
     historico: List[str] = []
+    comentarios: List[Dict[str, Any]] = []
 
 
 class User(BaseModel):
@@ -126,14 +130,14 @@ class FirebaseService:
                 for f in filters:
                     query = query.where(filter=firestore.FieldFilter(f[0], f[1], f[2]))
 
-            if collection == "audit_logs":
+            if collection == "audit_logs" or collection == "notifications":
                 query = query.order_by("timestamp", direction=firestore.Query.DESCENDING)
 
             docs = query.stream()
             data = [doc.to_dict() | {'id': doc.id} for doc in docs]
             df = pd.DataFrame(data) if data else pd.DataFrame()
 
-            if 'created_at' in df.columns and collection != "audit_logs":
+            if 'created_at' in df.columns and collection not in ["audit_logs", "notifications"]:
                 df['created_at'] = pd.to_datetime(df['created_at'])
                 df = df.sort_values(by='created_at', ascending=False)
             return df
@@ -162,6 +166,8 @@ class FirebaseService:
             history_log = old_data.get('historico', [])
             now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
             for key, value in new_data.items():
+                if key == 'comentarios':
+                    continue
                 old_value = old_data.get(key)
                 if (old_value or "") != (value or ""):
                     log_entry = f"'{key.replace('_', ' ').capitalize()}' alterado de '{old_value}' para '{value}' por {username} em {now_str}"
@@ -345,10 +351,14 @@ class ViewManager:
         self._init_session_state()
 
     def _init_session_state(self):
-        defaults = {'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'confirm_delete': {},
-                    'edit_id': None, 'edit_user_id': None, 'confirm_delete_user': {}, 'reset_password_for_user': {},
-                    'focus_item': None, 'view_history_id': None, 'generate_pedido_from_rc': None,
-                    'confirm_restore': None, 'show_notifications': False, 'notifications': []}
+        defaults = {
+            'logged_in': False, 'username': "", 'role': "", 'page': "Login",
+            'confirm_delete': {}, 'edit_id': None, 'edit_user_id': None,
+            'confirm_delete_user': {}, 'reset_password_for_user': {}, 'focus_item': None,
+            'view_history_id': None, 'generate_pedido_from_rc': None, 'confirm_restore': None,
+            'show_notifications': False, 'notifications_list': [],
+            'editing_comment': None, 'confirm_delete_comment': None
+        }
         for key, value in defaults.items():
             if key not in st.session_state: st.session_state[key] = value
 
@@ -539,24 +549,58 @@ class ViewManager:
                 st.rerun()
 
     def render_notification_bell(self):
-        num_notifications = 0
+        all_notifications = []
+
+        # 1. Admin notifications for pending users
         if st.session_state.role == 'admin':
             pending_users = self.db.get_docs("users", [("status", "==", "pending")])
-            num_notifications = len(pending_users)
-            st.session_state.notifications = [f"Aprovação pendente: {user['username']}" for _, user in
-                                              pending_users.iterrows()] if num_notifications > 0 else []
+            for _, user in pending_users.iterrows():
+                all_notifications.append({
+                    "id": f"admin_approval_{user['id']}",
+                    "message": f"Aprovação pendente: {user['username']}",
+                    "type": "admin_approval"
+                })
+
+        # 2. User mention notifications
+        user_notifications_df = self.db.get_docs("notifications", [
+            ("username", "==", st.session_state.username),
+            ("read", "==", False)
+        ])
+        if not user_notifications_df.empty:
+            for _, notif in user_notifications_df.iterrows():
+                all_notifications.append(notif.to_dict())
+
+        st.session_state.notifications_list = all_notifications
+        num_notifications = len(all_notifications)
+
         label = f"🔔 ({num_notifications})" if num_notifications > 0 else "🔔"
-        if st.button(label, help="Ver notificações"): st.session_state.show_notifications = not st.session_state.get(
-            'show_notifications', False); st.rerun()
+        if st.button(label, help="Ver notificações"):
+            st.session_state.show_notifications = not st.session_state.get('show_notifications', False)
+            st.rerun()
 
     @st.dialog("🔔 Notificações")
     def render_notifications_modal(self):
-        notifications = st.session_state.get('notifications', [])
+        notifications = st.session_state.get('notifications_list', [])
         if not notifications:
             st.info("Nenhuma notificação nova.")
         else:
-            for n in notifications: st.warning(n)
-        if st.button("Fechar", key="close_notifications"): st.session_state.show_notifications = False; st.rerun()
+            for notif in notifications:
+                if notif.get('type') == 'admin_approval':
+                    st.warning(notif['message'])  # Non-clickable for now
+                else:
+                    if st.button(notif['message'], key=f"notif_{notif['id']}"):
+                        # Mark as read
+                        self.db.update_doc("notifications", notif['id'], {"read": True}, st.session_state.username)
+                        self.db.log_action("Notification Read", st.session_state.username,
+                                           {"notification_id": notif['id']})
+                        # Redirect
+                        st.session_state.focus_item = notif['link']
+                        st.session_state.show_notifications = False
+                        st.rerun()
+
+        if st.button("Fechar", key="close_notifications"):
+            st.session_state.show_notifications = False
+            st.rerun()
 
     def _render_paginated_rows(self, df: pd.DataFrame, render_function, key_suffix: str, **kwargs):
         if df.empty:
@@ -591,9 +635,11 @@ class ViewManager:
         doc_data = self.db.get_doc(collection, doc_id)
         if doc_data:
             row = pd.Series(doc_data)
+            all_users = self.db.get_docs("users")
             all_demandas = self.db.get_docs("demandas") if collection in ['requisicoes', 'pedidos'] else None
             all_rcs = self.db.get_docs("requisicoes") if collection == 'pedidos' else None
-            self.render_data_row(row, collection=collection, all_demandas=all_demandas, all_rcs=all_rcs)
+            self.render_data_row(row, collection=collection, all_demandas=all_demandas, all_rcs=all_rcs,
+                                 all_users=all_users)
         else:
             st.error("Item não encontrado.")
 
@@ -673,18 +719,11 @@ class ViewManager:
 
         st.header("Demandas Registradas")
 
-        df_demandas, df_rcs, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs(
-            "requisicoes"), self.db.get_docs("pedidos")
+        df_demandas, df_rcs, df_pedidos, df_users = self.db.get_docs("demandas"), self.db.get_docs(
+            "requisicoes"), self.db.get_docs("pedidos"), self.db.get_docs("users")
 
         self._render_paginated_rows(df_demandas, self.render_data_row, "demandas", collection="demandas",
-                                    all_rcs=df_rcs, all_pedidos=df_pedidos)
-
-    def _clear_demanda_filters(self):
-        st.session_state.demanda_search = ""
-        st.session_state.demanda_tipo_filter = "Todos"
-        st.session_state.demanda_cat_filter = "Todas"
-        st.session_state.demanda_start_date = None
-        st.session_state.demanda_end_date = None
+                                    all_rcs=df_rcs, all_pedidos=df_pedidos, all_users=df_users)
 
     def _clear_rc_filters(self):
         st.session_state.rc_search = ""
@@ -818,7 +857,8 @@ class ViewManager:
                             except Exception as e:
                                 st.error(f"Erro ao registrar: {e}")
         st.header("Requisições Registradas")
-        df_rc, df_demandas = self.db.get_docs("requisicoes"), self.db.get_docs("demandas")
+        df_rc, df_demandas, df_users = self.db.get_docs("requisicoes"), self.db.get_docs("demandas"), self.db.get_docs(
+            "users")
 
         with st.expander("🔍 Filtros e Pesquisa"):
             c1, c2 = st.columns(2)
@@ -845,12 +885,12 @@ class ViewManager:
         if not filtered_rcs.empty: st.download_button("📥 Exportar para Excel",
                                                       to_excel(filtered_rcs, "Relatório de RCs"), 'relatorio_rcs.xlsx')
         self._render_paginated_rows(filtered_rcs, self.render_data_row, "rcs", collection="requisicoes",
-                                    all_demandas=df_demandas)
+                                    all_demandas=df_demandas, all_users=df_users)
 
     def render_pedidos(self):
         st.header("🚚 Pedidos de Compra")
-        all_pedidos, all_rcs, all_demandas = self.db.get_docs("pedidos"), self.db.get_docs(
-            "requisicoes"), self.db.get_docs("demandas")
+        all_pedidos, all_rcs, all_demandas, all_users = self.db.get_docs("pedidos"), self.db.get_docs(
+            "requisicoes"), self.db.get_docs("demandas"), self.db.get_docs("users")
 
         with st.expander("🔍 Filtros e Pesquisa"):
             c1, _ = st.columns(2)
@@ -881,7 +921,24 @@ class ViewManager:
                                                                  f'pedidos_{statuses[0].lower()}.xlsx',
                                                                  key=f'btn_{statuses[0]}')
                 self._render_paginated_rows(df_tab_filtered, self.render_data_row, f"pedidos_{statuses[0]}",
-                                            collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas)
+                                            collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas,
+                                            all_users=all_users)
+
+    def _format_comment_text(self, text: str, all_users_df: pd.DataFrame) -> str:
+        """Formata o texto do comentário para destacar menções @ a usuários válidos."""
+        if not isinstance(text, str):
+            return ""
+
+        user_mentions = re.findall(r'@(\w+)', text)
+        if not user_mentions:
+            return text
+
+        valid_usernames = all_users_df['username'].tolist() if not all_users_df.empty else []
+        for username in user_mentions:
+            if username in valid_usernames:
+                text = text.replace(f"@{username}", f"<strong>@{username}</strong>")
+
+        return text
 
     def render_data_row(self, row: pd.Series, collection: str, **kwargs):
         key, role = f"{collection}_{row['id']}", st.session_state.role
@@ -956,6 +1013,136 @@ class ViewManager:
                     st.session_state.confirm_delete = {};
                     st.rerun()
                 if c2.button("Cancelar", key=f"canc_del_{key}"): st.session_state.confirm_delete = {}; st.rerun()
+
+            with st.expander("💬 Comentários"):
+                self._render_comments_section(row, collection, **kwargs)
+
+    def _create_mention_notification(self, mentioned_user: str, author: str, collection: str, doc_id: str):
+        """Cria um documento de notificação para um usuário mencionado."""
+        item_map = {"demandas": "Demanda", "requisicoes": "Requisição", "pedidos": "Pedido"}
+        item_type = item_map.get(collection, collection[:-1])
+
+        notification_data = {
+            "username": mentioned_user,
+            "author": author,
+            "message": f"{author} mencionou você nos comentários da {item_type}.",
+            "link": {
+                "collection": collection,
+                "id": doc_id
+            },
+            "read": False,
+            "timestamp": datetime.now()
+        }
+        self.db.add_doc("notifications", notification_data)
+        self.db.log_action("Mention Notification Sent", author, {"to_user": mentioned_user, "doc_id": doc_id})
+
+    def _render_comments_section(self, row, collection, **kwargs):
+        comentarios = row.get('comentarios', [])
+        if not isinstance(comentarios, list):
+            comentarios = []
+
+        for c in comentarios:
+            if not isinstance(c.get('timestamp'), datetime):
+                try:
+                    c['timestamp'] = pd.to_datetime(c['timestamp']).to_pydatetime()
+                except:
+                    c['timestamp'] = datetime.now()
+
+        if not comentarios:
+            st.write("Nenhum comentário ainda.")
+        else:
+            all_users = kwargs.get('all_users', pd.DataFrame())
+            for comment in sorted(comentarios, key=lambda c: c['timestamp']):
+                comment_id = comment.get('id')
+                is_author = comment['username'] == st.session_state.username
+                is_admin = st.session_state.role == 'admin'
+
+                if comment_id and st.session_state.editing_comment == comment_id:
+                    with st.form(key=f"edit_form_{comment_id}"):
+                        edited_text = st.text_area("Editar:", value=comment['text'], key=f"edit_area_{comment_id}")
+                        c1, c2 = st.columns(2)
+                        if c1.form_submit_button("Salvar"):
+                            for c_item in comentarios:
+                                if c_item.get('id') == comment_id:
+                                    c_item['text'] = edited_text
+                                    c_item['edited_at'] = datetime.now()
+                                    break
+                            if self.db.update_doc(collection, row['id'], {"comentarios": comentarios},
+                                                  st.session_state.username):
+                                self.db.log_action(f"Comment Edited", st.session_state.username,
+                                                   {"doc_id": row['id'], "comment_id": comment_id})
+                                st.session_state.editing_comment = None
+                                st.rerun()
+                        if c2.form_submit_button("Cancelar"):
+                            st.session_state.editing_comment = None
+                            st.rerun()
+                else:
+                    col1, col2 = st.columns([0.9, 0.1])
+                    with col1:
+                        with st.chat_message(name=comment['username']):
+                            st.write(f"**{comment['username']}** em {comment['timestamp'].strftime('%d/%m/%Y %H:%M')}")
+                            formatted_text = self._format_comment_text(comment['text'], all_users)
+                            st.markdown(formatted_text, unsafe_allow_html=True)
+                            if 'edited_at' in comment:
+                                st.caption(
+                                    f"(editado em {pd.to_datetime(comment['edited_at']).strftime('%d/%m/%Y %H:%M')})")
+                    if comment_id:
+                        with col2:
+                            if is_author:
+                                if st.button("✏️", key=f"edit_btn_{comment_id}", help="Editar"):
+                                    st.session_state.editing_comment = comment_id
+                                    st.rerun()
+                            if is_author or is_admin:
+                                if st.button("🗑️", key=f"delete_btn_{comment_id}", help="Excluir"):
+                                    st.session_state.confirm_delete_comment = {'collection': collection,
+                                                                               'doc_id': row['id'],
+                                                                               'comment_id': comment_id}
+                                    st.rerun()
+
+        if st.session_state.confirm_delete_comment and st.session_state.confirm_delete_comment['doc_id'] == row['id']:
+            st.error("Tem certeza que deseja excluir este comentário?")
+            c1, c2, _ = st.columns([1, 1, 3])
+            if c1.button("Sim, excluir",
+                         key=f"confirm_del_comment_{st.session_state.confirm_delete_comment['comment_id']}",
+                         type="primary"):
+                comment_id_to_delete = st.session_state.confirm_delete_comment['comment_id']
+                updated_comments = [c for c in comentarios if c.get('id') != comment_id_to_delete]
+                if self.db.update_doc(collection, row['id'], {"comentarios": updated_comments},
+                                      st.session_state.username):
+                    self.db.log_action(f"Comment Deleted", st.session_state.username,
+                                       {"doc_id": row['id'], "comment_id": comment_id_to_delete})
+                    st.session_state.confirm_delete_comment = None
+                    st.rerun()
+            if c2.button("Cancelar", key=f"cancel_del_comment_{st.session_state.confirm_delete_comment['comment_id']}"):
+                st.session_state.confirm_delete_comment = None
+                st.rerun()
+
+        new_comment_text = st.text_area("Adicionar um comentário", key=f"comment_{row['id']}")
+        if st.button("Enviar Comentário", key=f"btn_comment_{row['id']}"):
+            if new_comment_text:
+                comment_data = {"id": str(uuid.uuid4()), "username": st.session_state.username,
+                                "timestamp": datetime.now(), "text": new_comment_text}
+                updated_comments = comentarios + [comment_data]
+
+                all_users_df = kwargs.get('all_users', pd.DataFrame())
+                valid_usernames = all_users_df['username'].tolist() if not all_users_df.empty else []
+                mentioned_users = re.findall(r'@(\w+)', new_comment_text)
+
+                for mentioned_user in set(mentioned_users):
+                    if mentioned_user in valid_usernames and mentioned_user != st.session_state.username:
+                        self._create_mention_notification(
+                            mentioned_user=mentioned_user,
+                            author=st.session_state.username,
+                            collection=collection,
+                            doc_id=row['id']
+                        )
+
+                if self.db.update_doc(collection, row['id'], {"comentarios": updated_comments},
+                                      st.session_state.username):
+                    self.db.log_action(f"Comment Added", st.session_state.username, {"doc_id": row['id']})
+                    st.rerun()
+            else:
+                st.warning("O comentário não pode estar vazio.")
 
     @st.dialog("Histórico de Alterações")
     def render_history_modal(self):
