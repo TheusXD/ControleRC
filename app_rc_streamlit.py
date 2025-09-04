@@ -18,6 +18,7 @@ import logging
 import json
 import base64
 import uuid
+import requests
 
 # Configurar o logging para monitorizar a aplicação
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -357,7 +358,8 @@ class ViewManager:
             'confirm_delete_user': {}, 'reset_password_for_user': {}, 'focus_item': None,
             'view_history_id': None, 'generate_pedido_from_rc': None, 'confirm_restore': None,
             'show_notifications': False, 'notifications_list': [],
-            'editing_comment': None, 'confirm_delete_comment': None
+            'editing_comment': None, 'confirm_delete_comment': None,
+            'chat_messages': []
         }
         for key, value in defaults.items():
             if key not in st.session_state: st.session_state[key] = value
@@ -413,7 +415,7 @@ class ViewManager:
         if st.session_state.focus_item:
             self.render_focused_view()
         else:
-            tabs = ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"]
+            tabs = ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos", "🤖 Chatbot de Busca"]
             if st.session_state.role == 'admin':
                 tabs.append("🛡️ Registros de Atividades")
 
@@ -427,8 +429,10 @@ class ViewManager:
                 self.render_requisicoes()
             with selected_tabs[3]:
                 self.render_pedidos()
+            with selected_tabs[4]:
+                self.render_chatbot_tab()
             if st.session_state.role == 'admin':
-                with selected_tabs[4]: self.render_logs_tab()
+                with selected_tabs[5]: self.render_logs_tab()
 
     def render_sidebar(self):
         with st.sidebar:
@@ -551,7 +555,6 @@ class ViewManager:
     def render_notification_bell(self):
         all_notifications = []
 
-        # 1. Admin notifications for pending users
         if st.session_state.role == 'admin':
             pending_users = self.db.get_docs("users", [("status", "==", "pending")])
             for _, user in pending_users.iterrows():
@@ -561,7 +564,6 @@ class ViewManager:
                     "type": "admin_approval"
                 })
 
-        # 2. User mention notifications
         user_notifications_df = self.db.get_docs("notifications", [
             ("username", "==", st.session_state.username),
             ("read", "==", False)
@@ -586,14 +588,12 @@ class ViewManager:
         else:
             for notif in notifications:
                 if notif.get('type') == 'admin_approval':
-                    st.warning(notif['message'])  # Non-clickable for now
+                    st.warning(notif['message'])
                 else:
                     if st.button(notif['message'], key=f"notif_{notif['id']}"):
-                        # Mark as read
                         self.db.update_doc("notifications", notif['id'], {"read": True}, st.session_state.username)
                         self.db.log_action("Notification Read", st.session_state.username,
                                            {"notification_id": notif['id']})
-                        # Redirect
                         st.session_state.focus_item = notif['link']
                         st.session_state.show_notifications = False
                         st.rerun()
@@ -1308,6 +1308,75 @@ class ViewManager:
             },
             hide_index=True
         )
+
+    def render_chatbot_tab(self):
+        st.header("🤖 Chatbot de Busca de Demandas")
+        st.info("Faça uma pergunta em linguagem natural para encontrar demandas. Ex: 'procure demandas de manutenção'")
+
+        if 'chat_messages' not in st.session_state:
+            st.session_state.chat_messages = []
+
+        for message in st.session_state.chat_messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        if prompt := st.chat_input("Como posso ajudar?"):
+            st.session_state.chat_messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                response = self._get_chatbot_response(prompt)
+                st.markdown(response)
+            st.session_state.chat_messages.append({"role": "assistant", "content": response})
+
+    def _get_chatbot_response(self, user_prompt: str) -> str:
+        with st.spinner("Consultando as demandas..."):
+            demandas_df = self.db.get_docs("demandas")
+            if demandas_df.empty:
+                return "Não há nenhuma demanda cadastrada no sistema para pesquisar."
+
+            demandas_context = "\n\n".join(
+                f"- ID: {row['id']}\n- Descrição: {row['descricao_necessidade']}\n- Tipo: {row['tipo']}\n- Categoria: {row['categoria']}\n- Status: {row['status_demanda']}"
+                for _, row in demandas_df.iterrows()
+            )
+
+        system_prompt = (
+            "Você é um assistente prestativo para um sistema de controle de compras. "
+            "Sua tarefa é ajudar os usuários a encontrar demandas com base em suas perguntas, usando a lista de demandas fornecida abaixo. "
+            "Responda de forma concisa e amigável em português. "
+            "Se encontrar uma ou mais demandas que correspondam à pergunta, liste a descrição, o status e o ID de cada uma. "
+            "Se não encontrar nenhuma demanda correspondente, informe que não foi possível localizar nada com os critérios informados."
+        )
+
+        full_prompt = f"{system_prompt}\n\nAqui está a lista de demandas atuais:\n---\n{demandas_context}\n---\n\nPergunta do usuário: {user_prompt}"
+
+        try:
+            api_key = st.secrets.get("GEMINI_API_KEY", "")
+            if not api_key:
+                return "Erro: A chave da API Gemini não está configurada nos secrets do Streamlit."
+
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
+
+            payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+
+            with st.spinner("O assistente está pensando..."):
+                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
+                response.raise_for_status()
+                result = response.json()
+
+                if 'candidates' in result and result['candidates']:
+                    return result['candidates'][0]['content']['parts'][0]['text']
+                else:
+                    logger.error(f"Resposta inesperada da API Gemini: {result}")
+                    return "Desculpe, não consegui obter uma resposta do assistente no momento."
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro ao chamar a API Gemini: {e}", exc_info=True)
+            return f"Ocorreu um erro de comunicação ao tentar contatar o assistente. Detalhes: {e}"
+        except (KeyError, IndexError) as e:
+            logger.error(f"Erro ao processar a resposta da API Gemini: {e}", exc_info=True)
+            return "Desculpe, recebi uma resposta em um formato inesperado do assistente."
 
 
 # -----------------------------------------------------------------------------
