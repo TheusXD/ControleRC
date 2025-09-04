@@ -65,7 +65,7 @@ class Pedido(BaseModel):
     observacao: Optional[str] = None
     data_entrega: Optional[datetime] = None
     email_notificacao: Optional[str] = None
-    anexo_email: Optional[Dict[str, str]] = None  # Novo campo para o anexo do e-mail
+    anexo_email: Optional[Dict[str, str]] = None
     historico: List[str] = []
 
 
@@ -433,7 +433,8 @@ class ViewManager:
                         if new_p != conf_p:
                             st.error("As novas senhas não coincidem.")
                         else:
-                            if self.auth.change_password(st.session_state.username, old_p, new_p):
+                            auth_service = AuthService(self.db)
+                            if auth_service.change_password(st.session_state.username, old_p, new_p):
                                 self.db.log_action("Password Changed", st.session_state.username)
                                 time.sleep(2)
                                 st.rerun()
@@ -469,7 +470,8 @@ class ViewManager:
             if rc1.button("Sim, restaurar", key="conf_restore_l", type="primary"):
                 self.db.log_action("Backup Restored", st.session_state.username,
                                    {"file_name": st.session_state.confirm_restore.name})
-                if self.db.restore_from_backup_data(json.load(st.session_state.confirm_restore)): st.success(
+                firebase_service = FirebaseService(dict(st.secrets["firebase_credentials"]))
+                if firebase_service.restore_from_backup_data(json.load(st.session_state.confirm_restore)): st.success(
                     "Backup restaurado!"); del st.session_state.confirm_restore; time.sleep(2); st.rerun()
             if rc2.button("Cancelar", key="canc_restore_l"): del st.session_state.confirm_restore; st.rerun()
 
@@ -596,7 +598,7 @@ class ViewManager:
             st.error("Item não encontrado.")
 
     def render_dashboard(self):
-        st.header("Dashboard de Métricas")
+        st.header("📊 Dashboard de Métricas")
         df_demandas, df_rc, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs(
             "requisicoes"), self.db.get_docs("pedidos")
         c1, c2, c3, c4 = st.columns(4)
@@ -627,7 +629,7 @@ class ViewManager:
                 st.info("Nenhuma categoria para exibir.")
 
     def render_demandas(self):
-        st.header("Demandas de Compras")
+        st.header("📝 Demandas de Compras")
         if st.session_state.role in ['admin', 'user', 'gestor']:
             with st.expander("➕ Adicionar Nova Demanda"):
                 with st.form("demanda_form", clear_on_submit=True):
@@ -670,10 +672,30 @@ class ViewManager:
                 self._render_bulk_upload_section()
 
         st.header("Demandas Registradas")
+
         df_demandas, df_rcs, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs(
             "requisicoes"), self.db.get_docs("pedidos")
+
         self._render_paginated_rows(df_demandas, self.render_data_row, "demandas", collection="demandas",
                                     all_rcs=df_rcs, all_pedidos=df_pedidos)
+
+    def _clear_demanda_filters(self):
+        st.session_state.demanda_search = ""
+        st.session_state.demanda_tipo_filter = "Todos"
+        st.session_state.demanda_cat_filter = "Todas"
+        st.session_state.demanda_start_date = None
+        st.session_state.demanda_end_date = None
+
+    def _clear_rc_filters(self):
+        st.session_state.rc_search = ""
+        st.session_state.rc_status_filter = "Todos"
+        st.session_state.rc_start_date = None
+        st.session_state.rc_end_date = None
+
+    def _clear_pedido_filters(self):
+        st.session_state.pedido_search = ""
+        st.session_state.pedido_start_date = None
+        st.session_state.pedido_end_date = None
 
     def _render_bulk_upload_section(self):
         st.info(
@@ -735,7 +757,7 @@ class ViewManager:
                 st.error(f"Erro ao processar o arquivo: {e}")
 
     def render_requisicoes(self):
-        st.header("Requisições de Compra (RCs)")
+        st.header("🛒 Requisições de Compra (RCs)")
         if st.session_state.role in ['admin', 'user']:
             with st.expander("➕ Adicionar Nova Requisição"):
                 st.subheader("Passo 1: Selecione a Demanda")
@@ -797,26 +819,68 @@ class ViewManager:
                                 st.error(f"Erro ao registrar: {e}")
         st.header("Requisições Registradas")
         df_rc, df_demandas = self.db.get_docs("requisicoes"), self.db.get_docs("demandas")
-        if not df_rc.empty: st.download_button("📥 Exportar para Excel", to_excel(df_rc, "Relatório de RCs"),
-                                               'relatorio_rcs.xlsx')
-        self._render_paginated_rows(df_rc, self.render_data_row, "rcs", collection="requisicoes",
+
+        with st.expander("🔍 Filtros e Pesquisa"):
+            c1, c2 = st.columns(2)
+            search_term_rc = c1.text_input("Pesquisar por número da RC", key="rc_search")
+            selected_status_rc = c2.selectbox("Filtrar por status",
+                                              ["Todos"] + ["Aberto", "Pedido Gerado", "Cancelado"],
+                                              key="rc_status_filter")
+
+            c1_date_rc, c2_date_rc, c3_date_rc = st.columns(3)
+            start_date_rc = c1_date_rc.date_input("Data inicial", value=None, key="rc_start_date")
+            end_date_rc = c2_date_rc.date_input("Data final", value=None, key="rc_end_date")
+            c3_date_rc.button("Limpar Filtros", key="clear_rc_filters", on_click=self._clear_rc_filters)
+
+        filtered_rcs = df_rc
+        if search_term_rc:
+            filtered_rcs = filtered_rcs[filtered_rcs['numero_rc'].str.contains(search_term_rc, case=False, na=False)]
+        if selected_status_rc != "Todos":
+            filtered_rcs = filtered_rcs[filtered_rcs['status'] == selected_status_rc]
+        if start_date_rc:
+            filtered_rcs = filtered_rcs[filtered_rcs['created_at'].dt.date >= start_date_rc]
+        if end_date_rc:
+            filtered_rcs = filtered_rcs[filtered_rcs['created_at'].dt.date <= end_date_rc]
+
+        if not filtered_rcs.empty: st.download_button("📥 Exportar para Excel",
+                                                      to_excel(filtered_rcs, "Relatório de RCs"), 'relatorio_rcs.xlsx')
+        self._render_paginated_rows(filtered_rcs, self.render_data_row, "rcs", collection="requisicoes",
                                     all_demandas=df_demandas)
 
     def render_pedidos(self):
-        st.header("Pedidos de Compra")
+        st.header("🚚 Pedidos de Compra")
         all_pedidos, all_rcs, all_demandas = self.db.get_docs("pedidos"), self.db.get_docs(
             "requisicoes"), self.db.get_docs("demandas")
+
+        with st.expander("🔍 Filtros e Pesquisa"):
+            c1, _ = st.columns(2)
+            search_term_pedido = c1.text_input("Pesquisar por número do pedido", key="pedido_search")
+
+            c1_date_ped, c2_date_ped, c3_date_ped = st.columns(3)
+            start_date_ped = c1_date_ped.date_input("Data inicial", value=None, key="pedido_start_date")
+            end_date_ped = c2_date_ped.date_input("Data final", value=None, key="pedido_end_date")
+            c3_date_ped.button("Limpar Filtros", key="clear_pedido_filters", on_click=self._clear_pedido_filters)
+
+        filtered_pedidos = all_pedidos
+        if search_term_pedido:
+            filtered_pedidos = filtered_pedidos[
+                filtered_pedidos['numero_pedido'].str.contains(search_term_pedido, case=False, na=False)]
+        if start_date_ped:
+            filtered_pedidos = filtered_pedidos[filtered_pedidos['created_at'].dt.date >= start_date_ped]
+        if end_date_ped:
+            filtered_pedidos = filtered_pedidos[filtered_pedidos['created_at'].dt.date <= end_date_ped]
+
         tabs = st.tabs(["⏳ Em Andamento", "✅ Entregues", "❌ Cancelados"])
         status_map = [['Em Processamento', 'Em Transporte'], ['Entregue'], ['Cancelado']]
         for tab, statuses in zip(tabs, status_map):
             with tab:
-                df_filtered = all_pedidos[
-                    all_pedidos['status'].isin(statuses)] if not all_pedidos.empty else pd.DataFrame()
-                if not df_filtered.empty: st.download_button("📥 Exportar",
-                                                             to_excel(df_filtered, f"Pedidos {statuses[0]}"),
-                                                             f'pedidos_{statuses[0].lower()}.xlsx',
-                                                             key=f'btn_{statuses[0]}')
-                self._render_paginated_rows(df_filtered, self.render_data_row, f"pedidos_{statuses[0]}",
+                df_tab_filtered = filtered_pedidos[
+                    filtered_pedidos['status'].isin(statuses)] if not filtered_pedidos.empty else pd.DataFrame()
+                if not df_tab_filtered.empty: st.download_button("📥 Exportar",
+                                                                 to_excel(df_tab_filtered, f"Pedidos {statuses[0]}"),
+                                                                 f'pedidos_{statuses[0].lower()}.xlsx',
+                                                                 key=f'btn_{statuses[0]}')
+                self._render_paginated_rows(df_tab_filtered, self.render_data_row, f"pedidos_{statuses[0]}",
                                             collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas)
 
     def render_data_row(self, row: pd.Series, collection: str, **kwargs):
@@ -1076,3 +1140,4 @@ if __name__ == "__main__":
         st.error("Ocorreu um erro crítico na aplicação.")
         st.exception(e)
         logger.critical(f"Erro crítico na aplicação: {e}", exc_info=True)
+
