@@ -614,7 +614,7 @@ class ViewManager:
 
     def _render_paginated_rows(self, df: pd.DataFrame, render_function, key_suffix: str, **kwargs):
         if df.empty:
-            st.info("Nenhum dado encontrado.")
+            st.info("Nenhum dado encontrado para os filtros selecionados.")
             return
 
         items_per_page = st.selectbox("Itens por página", [5, 10, 20], key=f"items_{key_suffix}", index=1)
@@ -717,6 +717,61 @@ class ViewManager:
             - Mencione outros usuários com `@nome` para enviar uma notificação a eles.
             """)
 
+    def render_advanced_filters(self, df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+        """Renderiza um expander com filtros avançados para um DataFrame."""
+        with st.expander("🔍 Filtros Avançados"):
+            if df.empty:
+                return df
+
+            filtered_df = df.copy()
+            cols = st.columns(3)
+
+            # --- Filtro de Texto Genérico ---
+            with cols[0]:
+                search_term = st.text_input("Buscar por texto...", key=f"search_{key_prefix}",
+                                            help="Busca em campos como descrição, número do RC/Pedido, etc.")
+                if search_term:
+                    text_cols = filtered_df.select_dtypes(include=['object']).columns.tolist()
+                    filtered_df = filtered_df[
+                        filtered_df[text_cols].apply(
+                            lambda row: row.astype(str).str.contains(search_term, case=False).any(), axis=1
+                        )
+                    ]
+
+            # --- Filtros por Categoria/Status (Multiselect) ---
+            with cols[1]:
+                filter_cols_map = {
+                    'status_demanda': 'Status da Demanda',
+                    'status': 'Status',
+                    'categoria': 'Categoria',
+                    'tipo': 'Tipo',
+                    'solicitante_demanda': 'Solicitante',
+                    'solicitante': 'Solicitante',
+                    'assigned_to': 'Atribuído a'
+                }
+                for col, label in filter_cols_map.items():
+                    if col in filtered_df.columns:
+                        options = sorted(filtered_df[col].dropna().unique())
+                        if options:
+                            selected = st.multiselect(label, options, key=f"filter_{col}_{key_prefix}")
+                            if selected:
+                                filtered_df = filtered_df[filtered_df[col].isin(selected)]
+
+            # --- Filtro por Data ---
+            with cols[2]:
+                if 'created_at' in filtered_df.columns:
+                    start_date = st.date_input("De:", value=None, key=f"start_date_{key_prefix}")
+                    end_date = st.date_input("Até:", value=None, key=f"end_date_{key_prefix}")
+
+                    date_series = pd.to_datetime(filtered_df['created_at']).dt.date
+
+                    if start_date:
+                        filtered_df = filtered_df[date_series >= start_date]
+                    if end_date:
+                        filtered_df = filtered_df[date_series <= end_date]
+
+            return filtered_df
+
     def render_demandas(self):
         st.header("📝 Demandas de Compras")
         if st.session_state.role in ['admin', 'user', 'gestor']:
@@ -779,11 +834,19 @@ class ViewManager:
         df_demandas, df_rcs, df_pedidos, df_users = self.db.get_docs("demandas"), self.db.get_docs(
             "requisicoes"), self.db.get_docs("pedidos"), self.db.get_docs("users")
 
-        with st.expander("🔍 Filtros e Pesquisa"):
-            # ... (código de filtros omitido para brevidade) ...
-            pass
+        filtered_demandas = self.render_advanced_filters(df_demandas, "demandas")
 
-        self._render_paginated_rows(df_demandas, self.render_data_row, "demandas", collection="demandas",
+        if not filtered_demandas.empty:
+            st.download_button(
+                label="📥 Exportar para Excel",
+                data=to_excel(filtered_demandas, "Demandas"),
+                file_name="demandas_exportadas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="export_demandas"
+            )
+        st.divider()
+
+        self._render_paginated_rows(filtered_demandas, self.render_data_row, "demandas", collection="demandas",
                                     all_rcs=df_rcs, all_pedidos=df_pedidos, all_users=df_users)
 
     def _render_bulk_upload_section(self):
@@ -844,6 +907,32 @@ class ViewManager:
                 st.rerun()
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
+
+    # ***** NOVO MÉTODO AUXILIAR PARA PREPARAR EXPORTAÇÃO DE RCs *****
+    def _prepare_df_for_export_rc(self, df_rc: pd.DataFrame, df_demandas: pd.DataFrame) -> pd.DataFrame:
+        """Junta o DataFrame de RCs com o de demandas para substituir a ID pela descrição."""
+        if df_rc.empty or df_demandas.empty or 'demanda_id' not in df_rc.columns:
+            return df_rc
+
+        df_demandas_subset = df_demandas[['id', 'descricao_necessidade']].copy()
+
+        merged_df = pd.merge(
+            df_rc,
+            df_demandas_subset,
+            left_on='demanda_id',
+            right_on='id',
+            how='left',
+            suffixes=('', '_demanda')
+        )
+
+        merged_df['descricao_necessidade'] = merged_df['descricao_necessidade'].fillna('Demanda não encontrada')
+        merged_df = merged_df.rename(columns={'descricao_necessidade': 'Descrição da Demanda'})
+
+        # Remove colunas de ID que não são mais necessárias para o usuário final
+        cols_to_drop = ['demanda_id', 'id_demanda']
+        merged_df = merged_df.drop(columns=[col for col in cols_to_drop if col in merged_df.columns], errors='ignore')
+
+        return merged_df
 
     def render_requisicoes(self):
         st.header("🛒 Requisições de Compra (RCs)")
@@ -909,25 +998,74 @@ class ViewManager:
                                 return
                             except Exception as e:
                                 st.error(f"Erro ao registrar: {e}")
+
         st.header("Requisições Registradas")
+
         df_rc, df_demandas, df_users = self.db.get_docs("requisicoes"), self.db.get_docs("demandas"), self.db.get_docs(
             "users")
 
-        with st.expander("🔍 Filtros e Pesquisa"):
-            # ... (código de filtros omitido para brevidade) ...
-            pass
+        filtered_rcs = self.render_advanced_filters(df_rc, "requisicoes")
 
-        self._render_paginated_rows(df_rc, self.render_data_row, "rcs", collection="requisicoes",
+        if not filtered_rcs.empty:
+            # ***** MODIFICAÇÃO AQUI: Prepara os dados antes de exportar *****
+            df_for_export = self._prepare_df_for_export_rc(filtered_rcs, df_demandas)
+            st.download_button(
+                label="📥 Exportar para Excel",
+                data=to_excel(df_for_export, "Requisições"),  # Passa o DF preparado
+                file_name="requisicoes_exportadas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="export_requisicoes"
+            )
+        st.divider()
+
+        self._render_paginated_rows(filtered_rcs, self.render_data_row, "rcs", collection="requisicoes",
                                     all_demandas=df_demandas, all_users=df_users)
+
+    # ***** NOVO MÉTODO AUXILIAR PARA PREPARAR EXPORTAÇÃO DE PEDIDOS *****
+    def _prepare_df_for_export_pedidos(self, df_pedidos: pd.DataFrame, df_rcs: pd.DataFrame,
+                                       df_demandas: pd.DataFrame) -> pd.DataFrame:
+        """Junta Pedidos->RCs->Demandas para obter a descrição da demanda original."""
+        if df_pedidos.empty:
+            return df_pedidos
+
+        # Certifica que os dataframes necessários não estão vazios
+        if df_rcs.empty or df_demandas.empty:
+            df_pedidos['Descrição da Demanda'] = 'Dados de origem indisponíveis'
+            return df_pedidos
+
+        # Juntar Pedidos com RCs para obter o demanda_id
+        df_merged_rc = pd.merge(
+            df_pedidos,
+            df_rcs[['id', 'demanda_id']],
+            left_on='requisicao_id',
+            right_on='id',
+            how='left',
+            suffixes=('', '_rc')
+        )
+
+        # Juntar com Demandas para obter a descrição
+        df_final = pd.merge(
+            df_merged_rc,
+            df_demandas[['id', 'descricao_necessidade']],
+            left_on='demanda_id',
+            right_on='id',
+            how='left',
+            suffixes=('', '_demanda')
+        )
+
+        df_final['descricao_necessidade'] = df_final['descricao_necessidade'].fillna('Demanda original não encontrada')
+        df_final = df_final.rename(columns={'descricao_necessidade': 'Descrição da Demanda'})
+
+        # Remover IDs intermediários para um relatório mais limpo
+        cols_to_drop = ['requisicao_id', 'id_rc', 'demanda_id', 'id_demanda']
+        df_final = df_final.drop(columns=[col for col in cols_to_drop if col in df_final.columns], errors='ignore')
+
+        return df_final
 
     def render_pedidos(self):
         st.header("🚚 Pedidos de Compra")
         all_pedidos, all_rcs, all_demandas, all_users = self.db.get_docs("pedidos"), self.db.get_docs(
             "requisicoes"), self.db.get_docs("demandas"), self.db.get_docs("users")
-
-        with st.expander("🔍 Filtros e Pesquisa"):
-            # ... (código de filtros omitido para brevidade) ...
-            pass
 
         tabs = st.tabs(["⏳ Em Andamento", "✅ Entregues", "❌ Cancelados"])
         status_map = [['Em Processamento', 'Em Transporte'], ['Entregue'], ['Cancelado']]
@@ -935,11 +1073,21 @@ class ViewManager:
             with tab:
                 df_tab_filtered = all_pedidos[
                     all_pedidos['status'].isin(statuses)] if not all_pedidos.empty else pd.DataFrame()
-                if not df_tab_filtered.empty: st.download_button("📥 Exportar",
-                                                                 to_excel(df_tab_filtered, f"Pedidos {statuses[0]}"),
-                                                                 f'pedidos_{statuses[0].lower()}.xlsx',
-                                                                 key=f'btn_{statuses[0]}')
-                self._render_paginated_rows(df_tab_filtered, self.render_data_row, f"pedidos_{statuses[0]}",
+
+                final_filtered_pedidos = self.render_advanced_filters(df_tab_filtered, f"pedidos_{statuses[0]}")
+
+                if not final_filtered_pedidos.empty:
+                    # ***** MODIFICAÇÃO AQUI: Prepara os dados antes de exportar *****
+                    df_for_export = self._prepare_df_for_export_pedidos(final_filtered_pedidos, all_rcs, all_demandas)
+                    st.download_button(
+                        "📥 Exportar para Excel",
+                        to_excel(df_for_export, f"Pedidos {statuses[0]}"),  # Passa o DF preparado
+                        f'pedidos_{statuses[0].lower().replace(" ", "_")}.xlsx',
+                        key=f'btn_export_{statuses[0]}'
+                    )
+                st.divider()
+
+                self._render_paginated_rows(final_filtered_pedidos, self.render_data_row, f"pedidos_{statuses[0]}",
                                             collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas,
                                             all_users=all_users)
 
@@ -1379,4 +1527,3 @@ if __name__ == "__main__":
         st.error("Ocorreu um erro crítico na aplicação.")
         st.exception(e)
         logger.critical(f"Erro crítico na aplicação: {e}", exc_info=True)
-
