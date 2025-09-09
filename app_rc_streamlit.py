@@ -280,6 +280,43 @@ class AuthService:
                 st.rerun()
         st.session_state.last_activity = time.time()
 
+    # ##### MÉTODO ADICIONADO PARA CORRIGIR O ERRO #####
+    def change_password(self, username: str, old_password: str, new_password: str) -> bool:
+        """Altera a senha de um usuário após verificar a senha antiga."""
+        # 1. Valida a força da nova senha
+        if not self._validate_password_strength(new_password):
+            st.error("A nova senha deve ter no mínimo 8 caracteres, com maiúscula, minúscula e número.")
+            return False
+
+        # 2. Obtém os dados do usuário
+        user_df = self.db.get_docs("users", [("username", "==", username)])
+        if user_df.empty:
+            st.error("Usuário não encontrado. Ocorreu um erro inesperado.")
+            return False
+
+        user_data = user_df.iloc[0]
+
+        # 3. Verifica a senha antiga
+        if not self._check_password(user_data['password'], user_data['salt'], old_password):
+            st.error("A senha antiga está incorreta.")
+            return False
+
+        # 4. Gera o hash da nova senha
+        new_hashed_pw, new_salt = self._hash_password(new_password)
+
+        # 5. Atualiza o documento do usuário no banco de dados
+        update_data = {
+            "password": new_hashed_pw,
+            "salt": new_salt
+        }
+
+        if self.db.update_doc("users", user_data['id'], update_data, username):
+            st.success("Senha alterada com sucesso!")
+            return True
+        else:
+            st.error("Não foi possível alterar a senha. Tente novamente.")
+            return False
+
 
 # -----------------------------------------------------------------------------
 # 3. UI / VIEWS (LÓGICA DE APRESENTAÇÃO)
@@ -445,12 +482,14 @@ class ViewManager:
                     new_p = st.text_input("Nova Senha", type="password",
                                           help="A nova senha deve ter no mínimo 8 caracteres, com letras maiúsculas, minúsculas e números.")
                     conf_p = st.text_input("Confirmar Nova Senha", type="password")
+
+                    # ##### CHAMADA DA FUNÇÃO CORRIGIDA AQUI #####
                     if st.form_submit_button("Alterar Senha", type="primary"):
                         if new_p != conf_p:
                             st.error("As novas senhas não coincidem.")
                         else:
-                            auth_service = AuthService(self.db)
-                            if auth_service.change_password(st.session_state.username, old_p, new_p):
+                            # Use a instância que já existe em self.auth
+                            if self.auth.change_password(st.session_state.username, old_p, new_p):
                                 self.db.log_action("Password Changed", st.session_state.username)
                                 time.sleep(2)
                                 st.rerun()
@@ -908,7 +947,6 @@ class ViewManager:
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
 
-    # ***** NOVO MÉTODO AUXILIAR PARA PREPARAR EXPORTAÇÃO DE RCs *****
     def _prepare_df_for_export_rc(self, df_rc: pd.DataFrame, df_demandas: pd.DataFrame) -> pd.DataFrame:
         """Junta o DataFrame de RCs com o de demandas para substituir a ID pela descrição."""
         if df_rc.empty or df_demandas.empty or 'demanda_id' not in df_rc.columns:
@@ -1007,11 +1045,10 @@ class ViewManager:
         filtered_rcs = self.render_advanced_filters(df_rc, "requisicoes")
 
         if not filtered_rcs.empty:
-            # ***** MODIFICAÇÃO AQUI: Prepara os dados antes de exportar *****
             df_for_export = self._prepare_df_for_export_rc(filtered_rcs, df_demandas)
             st.download_button(
                 label="📥 Exportar para Excel",
-                data=to_excel(df_for_export, "Requisições"),  # Passa o DF preparado
+                data=to_excel(df_for_export, "Requisições"),
                 file_name="requisicoes_exportadas.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="export_requisicoes"
@@ -1021,19 +1058,16 @@ class ViewManager:
         self._render_paginated_rows(filtered_rcs, self.render_data_row, "rcs", collection="requisicoes",
                                     all_demandas=df_demandas, all_users=df_users)
 
-    # ***** NOVO MÉTODO AUXILIAR PARA PREPARAR EXPORTAÇÃO DE PEDIDOS *****
     def _prepare_df_for_export_pedidos(self, df_pedidos: pd.DataFrame, df_rcs: pd.DataFrame,
                                        df_demandas: pd.DataFrame) -> pd.DataFrame:
         """Junta Pedidos->RCs->Demandas para obter a descrição da demanda original."""
         if df_pedidos.empty:
             return df_pedidos
 
-        # Certifica que os dataframes necessários não estão vazios
         if df_rcs.empty or df_demandas.empty:
             df_pedidos['Descrição da Demanda'] = 'Dados de origem indisponíveis'
             return df_pedidos
 
-        # Juntar Pedidos com RCs para obter o demanda_id
         df_merged_rc = pd.merge(
             df_pedidos,
             df_rcs[['id', 'demanda_id']],
@@ -1043,7 +1077,6 @@ class ViewManager:
             suffixes=('', '_rc')
         )
 
-        # Juntar com Demandas para obter a descrição
         df_final = pd.merge(
             df_merged_rc,
             df_demandas[['id', 'descricao_necessidade']],
@@ -1056,7 +1089,6 @@ class ViewManager:
         df_final['descricao_necessidade'] = df_final['descricao_necessidade'].fillna('Demanda original não encontrada')
         df_final = df_final.rename(columns={'descricao_necessidade': 'Descrição da Demanda'})
 
-        # Remover IDs intermediários para um relatório mais limpo
         cols_to_drop = ['requisicao_id', 'id_rc', 'demanda_id', 'id_demanda']
         df_final = df_final.drop(columns=[col for col in cols_to_drop if col in df_final.columns], errors='ignore')
 
@@ -1077,11 +1109,10 @@ class ViewManager:
                 final_filtered_pedidos = self.render_advanced_filters(df_tab_filtered, f"pedidos_{statuses[0]}")
 
                 if not final_filtered_pedidos.empty:
-                    # ***** MODIFICAÇÃO AQUI: Prepara os dados antes de exportar *****
                     df_for_export = self._prepare_df_for_export_pedidos(final_filtered_pedidos, all_rcs, all_demandas)
                     st.download_button(
                         "📥 Exportar para Excel",
-                        to_excel(df_for_export, f"Pedidos {statuses[0]}"),  # Passa o DF preparado
+                        to_excel(df_for_export, f"Pedidos {statuses[0]}"),
                         f'pedidos_{statuses[0].lower().replace(" ", "_")}.xlsx',
                         key=f'btn_export_{statuses[0]}'
                     )
