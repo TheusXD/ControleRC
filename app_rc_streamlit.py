@@ -280,15 +280,12 @@ class AuthService:
                 st.rerun()
         st.session_state.last_activity = time.time()
 
-    # ##### MÉTODO ADICIONADO PARA CORRIGIR O ERRO #####
     def change_password(self, username: str, old_password: str, new_password: str) -> bool:
         """Altera a senha de um usuário após verificar a senha antiga."""
-        # 1. Valida a força da nova senha
         if not self._validate_password_strength(new_password):
             st.error("A nova senha deve ter no mínimo 8 caracteres, com maiúscula, minúscula e número.")
             return False
 
-        # 2. Obtém os dados do usuário
         user_df = self.db.get_docs("users", [("username", "==", username)])
         if user_df.empty:
             st.error("Usuário não encontrado. Ocorreu um erro inesperado.")
@@ -296,15 +293,12 @@ class AuthService:
 
         user_data = user_df.iloc[0]
 
-        # 3. Verifica a senha antiga
         if not self._check_password(user_data['password'], user_data['salt'], old_password):
             st.error("A senha antiga está incorreta.")
             return False
 
-        # 4. Gera o hash da nova senha
         new_hashed_pw, new_salt = self._hash_password(new_password)
 
-        # 5. Atualiza o documento do usuário no banco de dados
         update_data = {
             "password": new_hashed_pw,
             "salt": new_salt
@@ -437,12 +431,17 @@ class ViewManager:
             if st.form_submit_button("Registrar", type="primary"):
                 self.auth.register_user(username, email, password, is_gestor)
 
+    # ##### FUNÇÃO PRINCIPAL REESTRUTURADA PARA CORRIGIR O BUG DE EDIÇÃO #####
     def render_main_app(self):
         self.render_sidebar()
 
-        if st.session_state.focus_item:
+        # Lógica de renderização principal: prioriza telas de ação (editar, focar)
+        if st.session_state.edit_id:
+            self.render_edit_modal()
+        elif st.session_state.focus_item:
             self.render_focused_view()
         else:
+            # Se não houver ação, renderiza a visão normal com abas
             col1, col2 = st.columns([0.8, 0.2])
             with col1:
                 st.title("🚀 Sistema de Controle de Compras")
@@ -466,8 +465,7 @@ class ViewManager:
             if st.session_state.role == 'admin':
                 with selected_tabs[4]: self.render_logs_tab()
 
-        # Modais são renderizados no final para garantir que estejam disponíveis em todas as telas
-        self.render_edit_modal()
+        # Modais que usam @st.dialog podem ser chamados no final sem problemas
         if st.session_state.view_history_id: self.render_history_modal()
         if st.session_state.generate_pedido_from_rc: self.render_generate_pedido_modal()
         if st.session_state.get('show_notifications', False): self.render_notifications_modal()
@@ -483,12 +481,10 @@ class ViewManager:
                                           help="A nova senha deve ter no mínimo 8 caracteres, com letras maiúsculas, minúsculas e números.")
                     conf_p = st.text_input("Confirmar Nova Senha", type="password")
 
-                    # ##### CHAMADA DA FUNÇÃO CORRIGIDA AQUI #####
                     if st.form_submit_button("Alterar Senha", type="primary"):
                         if new_p != conf_p:
                             st.error("As novas senhas não coincidem.")
                         else:
-                            # Use a instância que já existe em self.auth
                             if self.auth.change_password(st.session_state.username, old_p, new_p):
                                 self.db.log_action("Password Changed", st.session_state.username)
                                 time.sleep(2)
@@ -966,7 +962,6 @@ class ViewManager:
         merged_df['descricao_necessidade'] = merged_df['descricao_necessidade'].fillna('Demanda não encontrada')
         merged_df = merged_df.rename(columns={'descricao_necessidade': 'Descrição da Demanda'})
 
-        # Remove colunas de ID que não são mais necessárias para o usuário final
         cols_to_drop = ['demanda_id', 'id_demanda']
         merged_df = merged_df.drop(columns=[col for col in cols_to_drop if col in merged_df.columns], errors='ignore')
 
@@ -1179,13 +1174,12 @@ class ViewManager:
 
             cols = st.columns([1, 1, 1, 2, 5])
             if (role == 'admin') or (role == 'user') or (role == 'gestor' and collection == 'demandas'):
-                if cols[0].button("✏️", key=f"edit_{key}", help="Editar"): st.session_state.edit_id = {
-                    'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
-            if role == 'admin' and cols[1].button("🗑️", key=f"del_{key}",
-                                                  help="Excluir"): st.session_state.confirm_delete = {
-                'collection': collection, 'id': row['id'], 'desc': title}; st.rerun()
-            if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"): st.session_state.view_history_id = {
-                'collection': collection, 'id': row['id'], 'data': row.to_dict()}; st.rerun()
+                if cols[0].button("✏️", key=f"edit_{key}", help="Editar"):
+                    st.session_state.edit_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()}
+            if role == 'admin' and cols[1].button("🗑️", key=f"del_{key}", help="Excluir"):
+                st.session_state.confirm_delete = {'collection': collection, 'id': row['id'], 'desc': title}
+            if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"):
+                st.session_state.view_history_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()}
 
             if collection == 'demandas':
                 all_rcs, all_pedidos = kwargs.get('all_rcs'), kwargs.get('all_pedidos')
@@ -1196,16 +1190,16 @@ class ViewManager:
                     linked_pedido = all_pedidos[all_pedidos[
                                                     'requisicao_id'] == rc_id] if all_pedidos is not None and not all_pedidos.empty else pd.DataFrame()
                     if not linked_pedido.empty:
-                        if cols[3].button("🚚 Ver Pedido", key=f"goto_ped_{key}"): st.session_state.focus_item = {
-                            'collection': 'pedidos', 'id': linked_pedido.iloc[0]['id']}; st.rerun()
+                        if cols[3].button("🚚 Ver Pedido", key=f"goto_ped_{key}"):
+                            st.session_state.focus_item = {'collection': 'pedidos', 'id': linked_pedido.iloc[0]['id']}
                     else:
-                        if cols[3].button("🛒 Ver RC", key=f"goto_rc_{key}"): st.session_state.focus_item = {
-                            'collection': 'requisicoes', 'id': rc_id}; st.rerun()
+                        if cols[3].button("🛒 Ver RC", key=f"goto_rc_{key}"):
+                            st.session_state.focus_item = {'collection': 'requisicoes', 'id': rc_id}
 
             if collection == "requisicoes" and status == "Aberto" and role in ['admin', 'user']:
                 if cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary"):
                     st.session_state.generate_pedido_from_rc = row.to_dict()
-                    st.rerun()
+
             if st.session_state.confirm_delete.get('id') == row['id']:
                 st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
                 c1, c2, _ = st.columns([1, 1, 8])
@@ -1213,9 +1207,11 @@ class ViewManager:
                     self.db.delete_doc(collection, row['id'])
                     self.db.log_action(f"{collection[:-1].capitalize()} Deleted", st.session_state.username,
                                        {"doc_id": row['id'], "description": title})
-                    st.session_state.confirm_delete = {};
+                    st.session_state.confirm_delete = {}
                     st.rerun()
-                if c2.button("Cancelar", key=f"canc_del_{key}"): st.session_state.confirm_delete = {}; st.rerun()
+                if c2.button("Cancelar", key=f"canc_del_{key}"):
+                    st.session_state.confirm_delete = {}
+                    st.rerun()
 
             with st.expander("💬 Comentários"):
                 self._render_comments_section(row, collection, **kwargs)
@@ -1406,70 +1402,72 @@ class ViewManager:
             st.rerun()
 
     def render_edit_modal(self):
-        if st.session_state.edit_id:
-            edit_info = st.session_state.edit_id
-            with st.form(key=f"edit_form_{edit_info['id']}"):
-                st.subheader(f"Editando {edit_info['collection'][:-1].capitalize()} ID: ...{edit_info['id'][-6:]}")
-                data, new_data, valor_str = edit_info['data'], {}, None
-                if edit_info['collection'] == 'demandas':
-                    new_data['descricao_necessidade'] = st.text_area("Descrição", data.get('descricao_necessidade', ''))
-                    tipos, categorias_fixas = ["Material", "Serviço"], ["Facilities/Eletromecânica",
-                                                                        "Manutenção de rede", "Tratamento",
-                                                                        "Tratamento (Laboratório)"]
-                    new_data['tipo'] = st.selectbox("Tipo", tipos, index=tipos.index(data.get('tipo')) if data.get(
-                        'tipo') in tipos else 0)
-                    new_data['categoria'] = st.selectbox("Categoria", categorias_fixas, index=categorias_fixas.index(
-                        data.get('categoria')) if data.get('categoria') in categorias_fixas else 0)
-                    opts = ["Aberta", "Em Atendimento", "Fechada", "Cancelada"]
-                    new_data['status_demanda'] = st.selectbox("Status", opts,
-                                                              index=opts.index(data.get('status_demanda')))
+        edit_info = st.session_state.edit_id
 
-                    all_users = self.db.get_docs("users")
-                    user_list = ["Ninguém"] + sorted(all_users['username'].unique().tolist())
-                    current_assigned = data.get('assigned_to')
-                    assigned_index = user_list.index(current_assigned) if current_assigned in user_list else 0
-                    new_data['assigned_to'] = st.selectbox("Atribuir para:", user_list, index=assigned_index)
-                    if new_data['assigned_to'] == "Ninguém":
-                        new_data['assigned_to'] = None
+        st.title(f"✏️ Editando {edit_info['collection'][:-1].capitalize()}")
 
-                elif edit_info['collection'] == 'requisicoes':
-                    new_data['numero_rc'] = st.text_input("Número da RC", data.get('numero_rc', ''))
-                    valor_str = st.text_input("Valor (R$)",
-                                              value=f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_',
-                                                                                                               '.'))
-                    opts = ["Aberto", "Pedido Gerado", "Cancelado"]
-                    new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
-                elif edit_info['collection'] == 'pedidos':
-                    new_data['numero_pedido'] = st.text_input("Número do Pedido", data.get('numero_pedido', ''))
-                    valor_str = st.text_input("Valor (R$)",
-                                              value=f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_',
-                                                                                                               '.'))
-                    opts = ["Em Processamento", "Em Transporte", "Entregue", "Cancelado"]
-                    new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
-                    entrega_val = pd.to_datetime(data.get('data_entrega')).date() if pd.notna(
-                        data.get('data_entrega')) else None
-                    data_entrega_input = st.date_input("Data de Entrega", value=entrega_val)
-                    new_data['data_entrega'] = datetime.combine(data_entrega_input,
-                                                                datetime.min.time()) if data_entrega_input else None
-                    new_data['observacao'] = st.text_area("Observação", data.get('observacao', ''))
+        with st.form(key=f"edit_form_{edit_info['id']}"):
+            st.subheader(f"ID: ...{edit_info['id'][-6:]}")
+            data, new_data, valor_str = edit_info['data'], {}, None
 
-                c1, c2 = st.columns(2)
-                if c1.form_submit_button("Salvar", type="primary"):
-                    try:
-                        if valor_str is not None: new_data['valor'] = parse_brazilian_float(valor_str)
-                        if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data,
-                                              st.session_state.username):
-                            self.db.log_action(f"{edit_info['collection'][:-1].capitalize()} Updated",
-                                               st.session_state.username, {"doc_id": edit_info['id'],
-                                                                           "changes": {k: v for k, v in new_data.items()
-                                                                                       if k != 'historico'}})
-                            st.toast("Atualizado!", icon="💾");
-                            st.session_state.edit_id = None;
-                            time.sleep(1);
-                            st.rerun()
-                    except ValueError:
-                        pass
-                if c2.form_submit_button("Cancelar"): st.session_state.edit_id = None; st.rerun()
+            if edit_info['collection'] == 'demandas':
+                new_data['descricao_necessidade'] = st.text_area("Descrição", data.get('descricao_necessidade', ''))
+                tipos, categorias_fixas = ["Material", "Serviço"], ["Facilities/Eletromecânica", "Manutenção de rede",
+                                                                    "Tratamento", "Tratamento (Laboratório)"]
+                new_data['tipo'] = st.selectbox("Tipo", tipos,
+                                                index=tipos.index(data.get('tipo')) if data.get('tipo') in tipos else 0)
+                new_data['categoria'] = st.selectbox("Categoria", categorias_fixas,
+                                                     index=categorias_fixas.index(data.get('categoria')) if data.get(
+                                                         'categoria') in categorias_fixas else 0)
+                opts = ["Aberta", "Em Atendimento", "Fechada", "Cancelada"]
+                new_data['status_demanda'] = st.selectbox("Status", opts, index=opts.index(data.get('status_demanda')))
+
+                all_users = self.db.get_docs("users")
+                user_list = ["Ninguém"] + sorted(all_users['username'].unique().tolist())
+                current_assigned = data.get('assigned_to')
+                assigned_index = user_list.index(current_assigned) if current_assigned in user_list else 0
+                new_data['assigned_to'] = st.selectbox("Atribuir para:", user_list, index=assigned_index)
+                if new_data['assigned_to'] == "Ninguém":
+                    new_data['assigned_to'] = None
+
+            elif edit_info['collection'] == 'requisicoes':
+                new_data['numero_rc'] = st.text_input("Número da RC", data.get('numero_rc', ''))
+                valor_str = st.text_input("Valor (R$)",
+                                          value=f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.'))
+                opts = ["Aberto", "Pedido Gerado", "Cancelado"]
+                new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
+            elif edit_info['collection'] == 'pedidos':
+                new_data['numero_pedido'] = st.text_input("Número do Pedido", data.get('numero_pedido', ''))
+                valor_str = st.text_input("Valor (R$)",
+                                          value=f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.'))
+                opts = ["Em Processamento", "Em Transporte", "Entregue", "Cancelado"]
+                new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
+                entrega_val = pd.to_datetime(data.get('data_entrega')).date() if pd.notna(
+                    data.get('data_entrega')) else None
+                data_entrega_input = st.date_input("Data de Entrega", value=entrega_val)
+                new_data['data_entrega'] = datetime.combine(data_entrega_input,
+                                                            datetime.min.time()) if data_entrega_input else None
+                new_data['observacao'] = st.text_area("Observação", data.get('observacao', ''))
+
+            c1, c2 = st.columns(2)
+            if c1.form_submit_button("Salvar", type="primary"):
+                try:
+                    if valor_str is not None: new_data['valor'] = parse_brazilian_float(valor_str)
+                    if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data,
+                                          st.session_state.username):
+                        self.db.log_action(f"{edit_info['collection'][:-1].capitalize()} Updated",
+                                           st.session_state.username, {"doc_id": edit_info['id'],
+                                                                       "changes": {k: v for k, v in new_data.items() if
+                                                                                   k != 'historico'}})
+                        st.toast("Atualizado!", icon="💾")
+                        st.session_state.edit_id = None
+                        time.sleep(1)
+                        st.rerun()
+                except ValueError:
+                    pass
+            if c2.form_submit_button("Cancelar"):
+                st.session_state.edit_id = None
+                st.rerun()
 
     def _generate_backup_data(self) -> bytes:
         try:
