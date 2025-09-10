@@ -82,6 +82,8 @@ class User(BaseModel):
     status: str
     department: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
+    # ##### MUDANÇA 1: Adicionando campo de permissões ao modelo de usuário #####
+    permissions: List[str] = []
 
 
 # -----------------------------------------------------------------------------
@@ -241,6 +243,7 @@ class AuthService:
         hashed_pw, salt = self._hash_password(password)
 
         try:
+            # O Pydantic irá incluir `permissions: []` por padrão aqui
             user_data = User(username=username, email=email, role=role, status=status).model_dump()
             user_data.update({"password": hashed_pw, "salt": salt})
             if self.db.add_doc("users", user_data):
@@ -252,16 +255,20 @@ class AuthService:
         except ValidationError as e:
             st.error(f"Erro de validação: {e}")
 
+    # ##### MUDANÇA 2: Alterar a função de login para guardar todos os dados do usuário #####
     def login_user(self, username, password):
         user_df = self.db.get_docs("users", [("username", "==", username)])
         if not user_df.empty:
-            user_data = user_df.iloc[0]
-            if user_data['status'] == 'pending':
+            user_data_row = user_df.iloc[0]
+            if user_data_row['status'] == 'pending':
                 st.warning("Sua conta está aguardando aprovação.")
-            elif self._check_password(user_data['password'], user_data['salt'], password):
+            elif self._check_password(user_data_row['password'], user_data_row['salt'], password):
                 st.session_state.logged_in = True
-                st.session_state.username = user_data['username']
-                st.session_state.role = user_data['role']
+                # Guarda o dicionário completo com os dados do usuário na sessão
+                st.session_state.user_data = user_data_row.to_dict()
+                # Mantém os antigos por conveniência
+                st.session_state.username = user_data_row['username']
+                st.session_state.role = user_data_row['role']
                 st.session_state.last_activity = time.time()
                 self.db.log_action("User Login", username)
                 st.rerun()
@@ -386,7 +393,7 @@ class ViewManager:
 
     def _init_session_state(self):
         defaults = {
-            'logged_in': False, 'username': "", 'role': "", 'page': "Login",
+            'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'user_data': {},
             'confirm_delete': {}, 'edit_id': None, 'edit_user_id': None,
             'confirm_delete_user': {}, 'reset_password_for_user': {}, 'focus_item': None,
             'view_history_id': None, 'generate_pedido_from_rc': None, 'confirm_restore': None,
@@ -396,7 +403,6 @@ class ViewManager:
         for key, value in defaults.items():
             if key not in st.session_state: st.session_state[key] = value
 
-    # ##### NOVAS FUNÇÕES DE CALLBACK PARA ALTERAR O ESTADO DE FORMA SEGURA #####
     def _set_edit_state(self, collection: str, item_data: dict):
         st.session_state.edit_id = {
             'collection': collection,
@@ -426,6 +432,16 @@ class ViewManager:
 
     def _set_generate_pedido_state(self, item_data: dict):
         st.session_state.generate_pedido_from_rc = item_data
+
+    # ##### MUDANÇA 3: Nova função para verificar permissões #####
+    def _has_permission(self, permission: str) -> bool:
+        """Verifica se o usuário logado tem uma permissão específica."""
+        # O admin sempre tem todas as permissões
+        if st.session_state.get("role") == "admin":
+            return True
+        # Obtém a lista de permissões do usuário logado
+        user_permissions = st.session_state.user_data.get("permissions", [])
+        return permission in user_permissions
 
     def run(self):
         if not st.session_state.logged_in:
@@ -465,13 +481,11 @@ class ViewManager:
     def render_main_app(self):
         self.render_sidebar()
 
-        # Lógica de renderização principal: prioriza telas de ação (editar, focar)
         if st.session_state.edit_id:
             self.render_edit_modal()
         elif st.session_state.focus_item:
             self.render_focused_view()
         else:
-            # Se não houver ação, renderiza a visão normal com abas
             col1, col2 = st.columns([0.8, 0.2])
             with col1:
                 st.title("🚀 Sistema de Controle de Compras")
@@ -495,7 +509,6 @@ class ViewManager:
             if st.session_state.role == 'admin':
                 with selected_tabs[4]: self.render_logs_tab()
 
-        # Modais que usam @st.dialog podem ser chamados no final sem problemas
         if st.session_state.view_history_id: self.render_history_modal()
         if st.session_state.generate_pedido_from_rc: self.render_generate_pedido_modal()
         if st.session_state.get('show_notifications', False): self.render_notifications_modal()
@@ -592,9 +605,17 @@ class ViewManager:
                          disabled=is_self): st.session_state.confirm_delete_user = {'id': user['id'], 'username': user[
                 'username']}; st.rerun()
 
+    # ##### MUDANÇA 4: Adicionar seletor de permissões no formulário de edição de usuário #####
     def _render_edit_user_form(self):
         user_data = self.db.get_doc("users", st.session_state.edit_user_id)
         st.subheader(f"Editando Usuário: {user_data['username']}")
+
+        # Dicionário de permissões disponíveis. Chave: nome interno, Valor: Rótulo na UI
+        AVAILABLE_PERMISSIONS = {
+            "pode_excluir": "Pode Excluir Itens (Demandas, RCs, Pedidos)",
+            # Adicione novas permissões aqui no futuro
+        }
+
         with st.form("edit_user_form"):
             email = st.text_input("E-mail", value=user_data.get('email', ''))
             role = st.selectbox("Cargo", ["user", "gestor", "admin"],
@@ -606,13 +627,32 @@ class ViewManager:
             department = st.selectbox("Departamento", departments, index=department_index,
                                       help="Selecione o departamento do usuário.")
 
+            st.divider()
+            st.subheader("Permissões Especiais")
+
+            current_permissions = user_data.get('permissions', [])
+            # Usa a função format_func para mostrar o rótulo amigável
+            selected_permissions = st.multiselect(
+                "Atribuir permissões",
+                options=list(AVAILABLE_PERMISSIONS.keys()),
+                default=current_permissions,
+                format_func=lambda p: AVAILABLE_PERMISSIONS[p]
+            )
+
             c1, c2 = st.columns(2)
             if c1.form_submit_button("Salvar Alterações", type="primary"):
                 try:
                     User(username=user_data['username'], email=email, role=role,
-                         status=user_data.get('status', 'active'), department=department)
+                         status=user_data.get('status', 'active'), department=department,
+                         permissions=selected_permissions)
 
-                    update_data = {"email": email, "role": role, "department": department}
+                    update_data = {
+                        "email": email,
+                        "role": role,
+                        "department": department,
+                        "permissions": selected_permissions
+                    }
+
                     if self.db.update_doc("users", user_data['id'], update_data, st.session_state.username):
                         self.db.log_action("User Edited", st.session_state.username,
                                            {"target_user": user_data['username'], "changes": update_data})
@@ -1163,7 +1203,7 @@ class ViewManager:
 
         return text
 
-    # ##### FUNÇÃO CORRIGIDA PARA USAR on_click, RESOLVENDO O BUG DO CLIQUE DUPLO #####
+    # ##### MUDANÇA 5: Usar a nova função de permissão e lógica de autoria #####
     def render_data_row(self, row: pd.Series, collection: str, **kwargs):
         key, role = f"{collection}_{row['id']}", st.session_state.role
         with st.container(border=True):
@@ -1204,11 +1244,17 @@ class ViewManager:
                                 st.info(demanda_info.iloc[0]['descricao_necessidade'])
 
             cols = st.columns([1, 1, 1, 2, 5])
-            if (role == 'admin') or (role == 'user') or (role == 'gestor' and collection == 'demandas'):
+
+            # Lógica de Edição: Apenas o criador do item ou quem tem permissão especial
+            solicitante = row.get('solicitante_demanda') or row.get('solicitante')
+            is_author = solicitante == st.session_state.username
+
+            if is_author or self._has_permission("pode_editar_todos"):  # Permissão futura
                 cols[0].button("✏️", key=f"edit_{key}", help="Editar", on_click=self._set_edit_state,
                                args=(collection, row.to_dict()))
 
-            if role == 'admin':
+            # Lógica de Exclusão: Apenas admin ou quem tem a permissão "pode_excluir"
+            if self._has_permission("pode_excluir"):
                 cols[1].button("🗑️", key=f"del_{key}", help="Excluir", on_click=self._set_delete_state,
                                args=(collection, row['id'], title))
 
