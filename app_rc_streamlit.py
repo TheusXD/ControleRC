@@ -396,6 +396,37 @@ class ViewManager:
         for key, value in defaults.items():
             if key not in st.session_state: st.session_state[key] = value
 
+    # ##### NOVAS FUNÇÕES DE CALLBACK PARA ALTERAR O ESTADO DE FORMA SEGURA #####
+    def _set_edit_state(self, collection: str, item_data: dict):
+        st.session_state.edit_id = {
+            'collection': collection,
+            'id': item_data['id'],
+            'data': item_data
+        }
+
+    def _set_delete_state(self, collection: str, item_id: str, item_desc: str):
+        st.session_state.confirm_delete = {
+            'collection': collection,
+            'id': item_id,
+            'desc': item_desc
+        }
+
+    def _set_history_state(self, collection: str, item_data: dict):
+        st.session_state.view_history_id = {
+            'collection': collection,
+            'id': item_data['id'],
+            'data': item_data
+        }
+
+    def _set_focus_state(self, collection: str, item_id: str):
+        st.session_state.focus_item = {
+            'collection': collection,
+            'id': item_id
+        }
+
+    def _set_generate_pedido_state(self, item_data: dict):
+        st.session_state.generate_pedido_from_rc = item_data
+
     def run(self):
         if not st.session_state.logged_in:
             self.render_login_page()
@@ -431,7 +462,6 @@ class ViewManager:
             if st.form_submit_button("Registrar", type="primary"):
                 self.auth.register_user(username, email, password, is_gestor)
 
-    # ##### FUNÇÃO PRINCIPAL REESTRUTURADA PARA CORRIGIR O BUG DE EDIÇÃO #####
     def render_main_app(self):
         self.render_sidebar()
 
@@ -1133,6 +1163,7 @@ class ViewManager:
 
         return text
 
+    # ##### FUNÇÃO CORRIGIDA PARA USAR on_click, RESOLVENDO O BUG DO CLIQUE DUPLO #####
     def render_data_row(self, row: pd.Series, collection: str, **kwargs):
         key, role = f"{collection}_{row['id']}", st.session_state.role
         with st.container(border=True):
@@ -1174,12 +1205,15 @@ class ViewManager:
 
             cols = st.columns([1, 1, 1, 2, 5])
             if (role == 'admin') or (role == 'user') or (role == 'gestor' and collection == 'demandas'):
-                if cols[0].button("✏️", key=f"edit_{key}", help="Editar"):
-                    st.session_state.edit_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()}
-            if role == 'admin' and cols[1].button("🗑️", key=f"del_{key}", help="Excluir"):
-                st.session_state.confirm_delete = {'collection': collection, 'id': row['id'], 'desc': title}
-            if cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico"):
-                st.session_state.view_history_id = {'collection': collection, 'id': row['id'], 'data': row.to_dict()}
+                cols[0].button("✏️", key=f"edit_{key}", help="Editar", on_click=self._set_edit_state,
+                               args=(collection, row.to_dict()))
+
+            if role == 'admin':
+                cols[1].button("🗑️", key=f"del_{key}", help="Excluir", on_click=self._set_delete_state,
+                               args=(collection, row['id'], title))
+
+            cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico", on_click=self._set_history_state,
+                           args=(collection, row.to_dict()))
 
             if collection == 'demandas':
                 all_rcs, all_pedidos = kwargs.get('all_rcs'), kwargs.get('all_pedidos')
@@ -1190,15 +1224,15 @@ class ViewManager:
                     linked_pedido = all_pedidos[all_pedidos[
                                                     'requisicao_id'] == rc_id] if all_pedidos is not None and not all_pedidos.empty else pd.DataFrame()
                     if not linked_pedido.empty:
-                        if cols[3].button("🚚 Ver Pedido", key=f"goto_ped_{key}"):
-                            st.session_state.focus_item = {'collection': 'pedidos', 'id': linked_pedido.iloc[0]['id']}
+                        cols[3].button("🚚 Ver Pedido", key=f"goto_ped_{key}", on_click=self._set_focus_state,
+                                       args=('pedidos', linked_pedido.iloc[0]['id']))
                     else:
-                        if cols[3].button("🛒 Ver RC", key=f"goto_rc_{key}"):
-                            st.session_state.focus_item = {'collection': 'requisicoes', 'id': rc_id}
+                        cols[3].button("🛒 Ver RC", key=f"goto_rc_{key}", on_click=self._set_focus_state,
+                                       args=('requisicoes', rc_id))
 
             if collection == "requisicoes" and status == "Aberto" and role in ['admin', 'user']:
-                if cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary"):
-                    st.session_state.generate_pedido_from_rc = row.to_dict()
+                cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary",
+                               on_click=self._set_generate_pedido_state, args=(row.to_dict(),))
 
             if st.session_state.confirm_delete.get('id') == row['id']:
                 st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
