@@ -18,14 +18,32 @@ import json
 import base64
 import uuid
 import bleach
+import requests
 
 # Configurar o logging para monitorizar a aplicação
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# CORREÇÃO BUG #5: Limites para prevenir memory leak em comentários
-MAX_COMMENTS_IN_DOCUMENT = 20  # Máximo de comentários no documento principal
-MAX_COMMENTS_DISPLAY = 50       # Máximo de comentários a exibir por vez
+# Constantes para o sistema de comentários
+MAX_COMMENTS_IN_DOCUMENT = 20
+MAX_COMMENTS_DISPLAY = 50
+
+# --- SOLUÇÃO DA TRANSAÇÃO: FUNÇÃO STANDALONE ---
+@firestore.transactional
+def _atomic_add_and_update_standalone(transaction, db, add_col, add_data, update_col, update_id, update_data):
+    """
+    Função transacional standalone que não depende de 'self' para evitar conflitos com o decorador.
+    """
+    update_doc_ref = db.collection(update_col).document(update_id)
+    snapshot = update_doc_ref.get(transaction=transaction)
+
+    if not snapshot.exists:
+        raise ValueError(f"Documento {update_id} não encontrado em {update_col}")
+
+    new_doc_ref = db.collection(add_col).document()
+    transaction.set(new_doc_ref, add_data)
+    transaction.update(update_doc_ref, update_data)
+
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Controle de Compras", layout="wide")
@@ -152,25 +170,14 @@ class FirebaseService:
             st.error(f"Erro ao adicionar em '{collection}': {e}");
             return False
 
-    # CORREÇÃO BUG #2: Método auxiliar para formatar valores do histórico
     def _format_value_for_history(self, value) -> str:
-        """
-        Formata valores para exibição legível no histórico.
-        CORREÇÃO: Trata adequadamente tipos complexos e valores longos.
-        """
-        if value is None:
-            return "Vazio"
-        if isinstance(value, datetime):
-            return value.strftime('%d/%m/%Y %H:%M')
-        if isinstance(value, (dict, list)):
-            return f"[{type(value).__name__} com {len(value)} item(s)]"
-        if isinstance(value, bool):
-            return "Sim" if value else "Não"
-        if isinstance(value, (int, float)):
-            return str(value)
+        if value is None: return "Vazio"
+        if isinstance(value, datetime): return value.strftime('%d/%m/%Y %H:%M')
+        if isinstance(value, (dict, list)): return f"[{type(value).__name__} com {len(value)} item(s)]"
+        if isinstance(value, bool): return "Sim" if value else "Não"
+        if isinstance(value, (int, float)): return str(value)
         if isinstance(value, str):
-            if len(value) > 100:
-                return value[:97] + "..."
+            if len(value) > 100: return value[:97] + "..."
             return value
         return str(value)[:100]
 
@@ -179,76 +186,48 @@ class FirebaseService:
             doc_ref = self.db.collection(collection).document(doc_id)
             current_doc = doc_ref.get()
             if not current_doc.exists:
-                st.error("Documento não encontrado para atualização.");
-                return False
+                st.error("Documento não encontrado para atualização."); return False
             old_data = current_doc.to_dict()
             history_log = old_data.get('historico', [])
             now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
-
-            # CORREÇÃO BUG #2: Loop de histórico atualizado
             for key, value in new_data.items():
-                # Ignorar campos que não devem ir para o histórico
-                if key in ['comentarios', 'historico', 'updated_at', 'using_comment_subcollection']:
-                    continue
-
+                if key in ['comentarios', 'historico', 'updated_at', 'using_comment_subcollection']: continue
                 old_value = old_data.get(key)
-                # Comparação adequada para diferentes tipos
                 if old_value != value:
                     old_formatted = self._format_value_for_history(old_value)
                     new_formatted = self._format_value_for_history(value)
                     field_name = key.replace('_', ' ').capitalize()
-                    history_log.append(
-                        f"'{field_name}' alterado de '{old_formatted}' "
-                        f"para '{new_formatted}' por {username} em {now_str}"
-                    )
-
-            if 'historico' in old_data:
-                new_data['historico'] = history_log
+                    history_log.append(f"'{field_name}' alterado de '{old_formatted}' para '{new_formatted}' por {username} em {now_str}")
+            if 'historico' in old_data: new_data['historico'] = history_log
             new_data['updated_at'] = datetime.now()
             doc_ref.update(new_data)
             return True
         except Exception as e:
             logger.error(f"Erro ao atualizar documento ID: {doc_id} em '{collection}': {e}", exc_info=True)
-            st.error(f"Erro ao atualizar em '{collection}': {e}");
-            return False
+            st.error(f"Erro ao atualizar em '{collection}': {e}"); return False
 
     def delete_doc(self, collection: str, doc_id: str) -> bool:
         try:
-            self.db.collection(collection).document(doc_id).delete();
-            return True
+            self.db.collection(collection).document(doc_id).delete(); return True
         except Exception as e:
             logger.error(f"Erro ao excluir documento ID: {doc_id} de '{collection}': {e}", exc_info=True)
-            st.error(f"Erro ao excluir de '{collection}': {e}");
-            return False
+            st.error(f"Erro ao excluir de '{collection}': {e}"); return False
 
-    # CORREÇÃO BUG #1: Adicionada validação de existência do documento antes da transação
-    @firestore.transactional
-    def _atomic_add_and_update(self, transaction, add_col, add_data, update_col, update_id, update_data):
-        """
-        Executa operação atômica de adicionar documento e atualizar outro.
-        """
-        update_doc_ref = self.db.collection(update_col).document(update_id)
-        snapshot = update_doc_ref.get(transaction=transaction)
-
-        if not snapshot.exists:
-            raise ValueError(f"Documento {update_id} não encontrado em {update_col}")
-
-        new_doc_ref = self.db.collection(add_col).document()
-        transaction.set(new_doc_ref, add_data)
-        transaction.update(update_doc_ref, update_data)
-
+    # SOLUÇÃO DA TRANSAÇÃO: MÉTODO NA CLASSE QUE CHAMA A FUNÇÃO STANDALONE
     def add_and_update_atomically(self, add_col, add_data, update_col, update_id, update_data) -> bool:
         try:
             transaction = self.db.transaction()
-            self._atomic_add_and_update(transaction, add_col, add_data, update_col, update_id, update_data)
+            # Chama a função standalone, passando o 'db' e todos os outros dados.
+            _atomic_add_and_update_standalone(
+                transaction, self.db, add_col, add_data, update_col, update_id, update_data
+            )
             return True
-        # CORREÇÃO BUG #1: Tratamento da exceção específica
         except ValueError as e:
             logger.error(f"Falha na transação atômica (ValueError): {e}", exc_info=True)
             st.error(f"Não foi possível concluir a operação: {e}")
             return False
-        except exceptions.FirebaseError as e:
-            logger.error(f"Falha na transação atômica (FirebaseError): {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Falha na transação atômica (Exception): {e}", exc_info=True)
             st.error(f"Ocorreu um erro de consistência de dados: {e}")
             return False
 
@@ -257,23 +236,18 @@ class FirebaseService:
             if isinstance(obj, dict): return {key: convert_strings_to_types(value) for key, value in obj.items()}
             if isinstance(obj, list): return [convert_strings_to_types(element) for element in obj]
             if isinstance(obj, str):
-                try:
-                    return datetime.fromisoformat(obj)
+                try: return datetime.fromisoformat(obj)
                 except (ValueError, TypeError):
                     try:
                         if obj.isdigit(): return int(obj)
                     except ValueError: pass
-                    try:
-                        return float(obj)
-                    except ValueError:
-                        return obj
+                    try: return float(obj)
+                    except ValueError: return obj
             return obj
-
         try:
             collections = ["users", "demandas", "requisicoes", "pedidos", "audit_logs", "notifications"]
             for collection in collections:
-                for doc in self.db.collection(collection).stream():
-                    doc.reference.delete()
+                for doc in self.db.collection(collection).stream(): doc.reference.delete()
             for collection, records in backup_data.items():
                 if collection in collections:
                     for record in records:
@@ -285,34 +259,25 @@ class FirebaseService:
                             if 'salt' in processed_record and isinstance(processed_record.get('salt'), str):
                                 processed_record['salt'] = base64.b64decode(processed_record['salt'])
                         self.db.collection(collection).add(processed_record)
-            logger.info("Dados restaurados com sucesso");
-            return True
+            logger.info("Dados restaurados com sucesso"); return True
         except Exception as e:
-            logger.error(f"Falha ao restaurar dados: {e}", exc_info=True);
-            return False
+            logger.error(f"Falha ao restaurar dados: {e}", exc_info=True); return False
 
-    # CORREÇÃO BUG #5: Métodos para gerenciar comentários em subcoleção
     def add_comment_to_subcollection(self, collection: str, doc_id: str, comment_data: Dict) -> bool:
-        """Adiciona comentário a uma subcoleção."""
         try:
-            self.db.collection(collection).document(doc_id).collection('comments').add(comment_data)
-            return True
+            self.db.collection(collection).document(doc_id).collection('comments').add(comment_data); return True
         except Exception as e:
-            logger.error(f"Erro ao adicionar comentário à subcoleção: {e}")
-            return False
+            logger.error(f"Erro ao adicionar comentário à subcoleção: {e}"); return False
 
     def get_comments_from_subcollection(self, collection: str, doc_id: str, limit: int = 50) -> List[Dict]:
-        """Obtém comentários de uma subcoleção."""
         try:
             comments_ref = self.db.collection(collection).document(doc_id).collection('comments')
             comments = comments_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
             return [{'id': doc.id, **doc.to_dict()} for doc in comments]
         except Exception as e:
-            logger.error(f"Erro ao obter comentários da subcoleção: {e}")
-            return []
+            logger.error(f"Erro ao obter comentários da subcoleção: {e}"); return []
 
     def migrate_comments_to_subcollection(self, collection: str, doc_id: str) -> bool:
-        """Migra comentários do array principal para subcoleção."""
         try:
             doc_ref = self.db.collection(collection).document(doc_id)
             doc = doc_ref.get()
@@ -320,24 +285,17 @@ class FirebaseService:
             doc_data = doc.to_dict()
             comments = doc_data.get('comentarios', [])
             if not comments: return True
-
             for comment in comments:
                 if not comment.get('id'): comment['id'] = str(uuid.uuid4())
                 self.add_comment_to_subcollection(collection, doc_id, comment)
-
-            doc_ref.update({
-                'comentarios': [],
-                'using_comment_subcollection': True
-            })
-            logger.info(f"Migrados {len(comments)} comentários para subcoleção em {collection}/{doc_id}")
-            return True
+            doc_ref.update({'comentarios': [], 'using_comment_subcollection': True})
+            logger.info(f"Migrados {len(comments)} comentários para subcoleção em {collection}/{doc_id}"); return True
         except Exception as e:
-            logger.error(f"Erro ao migrar comentários: {e}")
-            return False
+            logger.error(f"Erro ao migrar comentários: {e}"); return False
 
 class AuthService:
     SESSION_TIMEOUT_MINUTES = 30
-    PERMISSION_REFRESH_SECONDS = 300 # 5 minutos
+    PERMISSION_REFRESH_SECONDS = 300
     LOGIN_ATTEMPTS_LIMIT = 5
     LOCKOUT_MINUTES = 5
 
@@ -459,8 +417,6 @@ def format_brazilian_currency(value: float) -> str:
 def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
     output = io.BytesIO()
     df_copy = df.copy()
-
-    # CORREÇÃO BUG #3: Tratamento robusto de todas as colunas de data
     for col in df_copy.columns:
         if pd.api.types.is_datetime64_any_dtype(df_copy[col]):
             try:
@@ -471,9 +427,7 @@ def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
                     if hasattr(df_copy[col].dtype, 'tz') and df_copy[col].dtype.tz is not None:
                         df_copy[col] = df_copy[col].dt.tz_localize(None)
             except Exception as e:
-                logger.warning(f"Não foi possível processar timezone da coluna {col}: {e}")
-                pass
-
+                logger.warning(f"Não foi possível processar timezone da coluna {col}: {e}"); pass
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_copy.to_excel(writer, index=False, sheet_name=title)
         workbook, worksheet = writer.book, writer.sheets[title]
@@ -538,12 +492,7 @@ class ViewManager:
         if st.session_state.get("role") == "admin": return True
         return permission in st.session_state.user_data.get("permissions", [])
 
-    # CORREÇÃO BUG #4: Método de validação de arquivo
     def _validate_uploaded_file(self, uploaded_file, max_size_kb=750) -> tuple[bool, str]:
-        """
-        Valida arquivo enviado por tipo, extensão e tamanho.
-        Returns: tuple: (is_valid: bool, message: str)
-        """
         allowed_mime_types = {
             'application/pdf': ['.pdf'], 'image/jpeg': ['.jpg', '.jpeg'], 'image/png': ['.png'],
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
@@ -551,37 +500,23 @@ class ViewManager:
             'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
             'text/plain': ['.txt']
         }
-        if uploaded_file.size > max_size_kb * 1024:
-            return False, f"Arquivo muito grande! Tamanho máximo: {max_size_kb}KB"
-        if uploaded_file.size == 0:
-            return False, "Arquivo está vazio"
-
+        if uploaded_file.size > max_size_kb * 1024: return False, f"Arquivo muito grande! Tamanho máximo: {max_size_kb}KB"
+        if uploaded_file.size == 0: return False, "Arquivo está vazio"
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         all_allowed_extensions = [ext for exts in allowed_mime_types.values() for ext in exts]
-        if file_ext not in all_allowed_extensions:
-            return False, f"Extensão não permitida: {file_ext}. Permitidas: {', '.join(all_allowed_extensions)}"
-
-        if uploaded_file.type not in allowed_mime_types:
-            return False, f"Tipo de arquivo não permitido: {uploaded_file.type}"
-
-        if file_ext not in allowed_mime_types.get(uploaded_file.type, []):
-            return False, f"Extensão {file_ext} não corresponde ao tipo {uploaded_file.type}"
-
+        if file_ext not in all_allowed_extensions: return False, f"Extensão não permitida: {file_ext}. Permitidas: {', '.join(all_allowed_extensions)}"
+        if uploaded_file.type not in allowed_mime_types: return False, f"Tipo de arquivo não permitido: {uploaded_file.type}"
+        if file_ext not in allowed_mime_types.get(uploaded_file.type, []): return False, f"Extensão {file_ext} não corresponde ao tipo {uploaded_file.type}"
         file_bytes = uploaded_file.getvalue()
         if len(file_bytes) > 0:
-            if file_ext == '.pdf' and not file_bytes.startswith(b'%PDF'):
-                return False, "Arquivo não é um PDF válido"
-            if file_ext == '.png' and not file_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-                return False, "Arquivo não é um PNG válido"
-            if file_ext in ['.jpg', '.jpeg'] and not file_bytes.startswith(b'\xff\xd8\xff'):
-                return False, "Arquivo não é um JPEG válido"
+            if file_ext == '.pdf' and not file_bytes.startswith(b'%PDF'): return False, "Arquivo não é um PDF válido"
+            if file_ext == '.png' and not file_bytes.startswith(b'\x89PNG\r\n\x1a\n'): return False, "Arquivo não é um PNG válido"
+            if file_ext in ['.jpg', '.jpeg'] and not file_bytes.startswith(b'\xff\xd8\xff'): return False, "Arquivo não é um JPEG válido"
         return True, "Arquivo válido"
 
     def run(self):
-        if not st.session_state.logged_in:
-            self.render_login_page()
-        else:
-            self.auth.check_session_timeout(); self.render_main_app()
+        if not st.session_state.logged_in: self.render_login_page()
+        else: self.auth.check_session_timeout(); self.render_main_app()
 
     def render_login_page(self):
         _, col2, _ = st.columns([1, 2, 1])
@@ -745,7 +680,6 @@ class ViewManager:
                         st.session_state.focus_item = notif['link']; st.session_state.show_notifications = False; st.rerun()
         if st.button("Fechar"): st.session_state.show_notifications = False; st.rerun()
 
-    # CORREÇÃO BUG #6: Sincroniza paginação com mudanças no dataframe e items_per_page.
     def _render_paginated_rows(self, df: pd.DataFrame, render_function, key_suffix: str, **kwargs):
         if df.empty:
             st.info("Nenhum dado encontrado."); return
@@ -858,7 +792,6 @@ class ViewManager:
                     c1, c2 = st.columns(2); tipo = c1.selectbox("Tipo", ["Material", "Serviço"], index=None, placeholder="Selecione o tipo...")
                     categorias_fixas = ["Facilities/Eletromecânica", "Manutenção de rede", "Tratamento", "Tratamento (Laboratório)"]
                     categoria = c2.selectbox("Categoria", categorias_fixas, index=None, placeholder="Selecione a categoria...")
-                    # CORREÇÃO BUG #4: Validação rigorosa do arquivo de upload
                     uploaded_file = st.file_uploader("Anexo (Opcional, máx 750KB)", type=['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'doc', 'docx', 'txt'])
                     if st.form_submit_button("Registrar Demanda", type="primary"):
                         if not all([descricao, categoria, tipo]): st.error("Preencha todos os campos obrigatórios (Descrição, Tipo e Categoria)."); return
@@ -998,10 +931,10 @@ class ViewManager:
                 st.divider()
                 self._render_paginated_rows(final_filtered_pedidos, self.render_data_row, f"pedidos_{statuses[0]}", collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas, all_users=all_users)
 
-    # CORREÇÃO BUG #7: Usa Markdown seguro ao invés de HTML para prevenir XSS.
     def _format_comment_text(self, text: str, all_users_df: pd.DataFrame) -> str:
         if not isinstance(text, str): return ""
-        safe_text = text.replace('\\', '\\\\').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
+        safe_text = text.replace('\\', '\\\\').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`').replace('[', '\\[\
+').replace(']', '\\]')
         user_mentions = re.findall(r'@(\w+)', safe_text)
         if not user_mentions: return safe_text
         valid_usernames = all_users_df['username'].tolist() if not all_users_df.empty else []
@@ -1030,7 +963,7 @@ class ViewManager:
                         with st.expander("Ver Descrição da Demanda Original"): st.info(demanda_info.iloc[0]['descricao_necessidade'])
             cols = st.columns([1, 1, 1, 2, 5])
             is_author = (row.get('solicitante_demanda') or row.get('solicitante')) == st.session_state.username
-            if is_author or self._has_permission("pode_editar_todos"):
+            if is_author or self._has_permission("pode_excluir"):
                 cols[0].button("✏️", key=f"edit_{key}", help="Editar", on_click=self._set_edit_state, args=(collection, row.to_dict()))
             if self._has_permission("pode_excluir"):
                 cols[1].button("🗑️", key=f"del_{key}", help="Excluir", on_click=self._set_delete_state, args=(collection, row['id'], title))
@@ -1061,7 +994,6 @@ class ViewManager:
         self.db.add_doc("notifications", notification_data)
         self.db.log_action("Mention Notification Sent", author, {"to_user": mentioned_user, "doc_id": doc_id})
 
-    # CORREÇÃO BUG #5: Gerencia comentários com suporte a subcoleção para escalabilidade.
     def _render_comments_section(self, row, collection, **kwargs):
         using_subcollection = row.get('using_comment_subcollection', False)
         if using_subcollection:
@@ -1081,14 +1013,13 @@ class ViewManager:
         else:
             all_users = kwargs.get('all_users', pd.DataFrame())
             for comment in sorted(comentarios, key=lambda c: c.get('timestamp', datetime.min), reverse=True):
-                col1, _ = st.columns([0.9, 0.1]) # Esconder botões de editar/excluir por enquanto
+                col1, _ = st.columns([0.9, 0.1])
                 with col1:
                     with st.chat_message(name=comment['username']):
                         ts = comment.get('timestamp', datetime.now())
                         st.write(f"**{comment['username']}** em {ts.strftime('%d/%m/%Y %H:%M')}")
-                        # CORREÇÃO BUG #7: Renderizar com Markdown seguro
                         formatted_text = self._format_comment_text(comment['text'], all_users)
-                        st.markdown(formatted_text) # SEM unsafe_allow_html
+                        st.markdown(formatted_text)
                         if 'edited_at' in comment: st.caption(f"(editado em {pd.to_datetime(comment['edited_at']).strftime('%d/%m/%Y %H:%M')})")
         new_comment_text = st.text_area("Adicionar um comentário", key=f"comment_{row['id']}")
         if st.button("Enviar Comentário", key=f"btn_comment_{row['id']}"):
@@ -1217,7 +1148,6 @@ class ViewManager:
         if selected_user != "Todos": filtered_df = filtered_df[filtered_df['username'] == selected_user]
         if selected_action != "Todos": filtered_df = filtered_df[filtered_df['action'] == selected_action]
 
-        # CORREÇÃO PYARROW: Garante que a coluna 'details' seja string antes de exibir
         df_para_exibir = filtered_df[['timestamp', 'username', 'action', 'details']].copy()
         if 'details' in df_para_exibir.columns:
             df_para_exibir['details'] = df_para_exibir['details'].astype(str)
