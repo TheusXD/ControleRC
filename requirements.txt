@@ -1,8 +1,8 @@
 streamlit
 pandas
-openpyxl
 firebase-admin
+plotly-express
+openpyxl
 pydantic
-plotly
-fpdf
-email-validator
+bleach
+requests
