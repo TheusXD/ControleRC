@@ -213,11 +213,9 @@ class FirebaseService:
             logger.error(f"Erro ao excluir documento ID: {doc_id} de '{collection}': {e}", exc_info=True)
             st.error(f"Erro ao excluir de '{collection}': {e}"); return False
 
-    # SOLUÇÃO DA TRANSAÇÃO: MÉTODO NA CLASSE QUE CHAMA A FUNÇÃO STANDALONE
     def add_and_update_atomically(self, add_col, add_data, update_col, update_id, update_data) -> bool:
         try:
             transaction = self.db.transaction()
-            # Chama a função standalone, passando o 'db' e todos os outros dados.
             _atomic_add_and_update_standalone(
                 transaction, self.db, add_col, add_data, update_col, update_id, update_data
             )
@@ -723,12 +721,18 @@ class ViewManager:
         else: st.error("Item não encontrado.")
 
     def render_dashboard(self):
-        st.header("📊 Dashboard de Métricas"); self.render_tutorial()
+        st.header("📊 Dashboard de Métricas")
+        self.render_tutorial()
         df_demandas, df_rc, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs("requisicoes"), self.db.get_docs("pedidos")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total de Demandas", f"{len(df_demandas)} 📝"); c2.metric("Total de RCs", f"{len(df_rc)} 🛒");
-        c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚"); c4.metric("Valor Total em RCs", format_brazilian_currency(df_rc['valor'].sum() if not df_rc.empty else 0))
-        st.divider(); c1, c2 = st.columns(2)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
+        c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
+        c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
+        c4.metric("Valor Total em RCs", format_brazilian_currency(df_rc['valor'].sum() if not df_rc.empty else 0))
+        valor_total_pedidos = df_pedidos['valor'].sum() if not df_pedidos.empty else 0
+        c5.metric("Valor Total em Pedidos", format_brazilian_currency(valor_total_pedidos))
+        st.divider()
+        c1, c2 = st.columns(2)
         with c1:
             st.subheader("Status das Demandas")
             if not df_demandas.empty:
@@ -1049,9 +1053,11 @@ class ViewManager:
     @st.dialog("Gerar Pedido de Compra")
     def render_generate_pedido_modal(self):
         rc_data = st.session_state.generate_pedido_from_rc
-        st.write(f"Gerando pedido para a RC: **{rc_data.get('numero_rc', 'S/N')}** | Valor: **{format_brazilian_currency(rc_data.get('valor', 0))}**")
+        st.write(f"Gerando pedido para a RC: **{rc_data.get('numero_rc', 'S/N')}** | Valor Original: **{format_brazilian_currency(rc_data.get('valor', 0))}**")
         with st.form("generate_pedido_form"):
             numero_pedido = st.text_input("Número do Pedido", value=f"PED-{rc_data.get('numero_rc', rc_data['id'][-4:])}")
+            valor_sugerido = f"{rc_data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.')
+            valor_final_str = st.text_input("Valor Final do Pedido (R$)", value=valor_sugerido)
             email_notificacao_str = st.text_area("E-mail para Notificação (opcional)")
             anexo_email_file = st.file_uploader("Anexo para E-mail (opcional)", type=['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'doc', 'docx', 'txt'])
             if st.form_submit_button("Confirmar", type="primary"):
@@ -1063,13 +1069,17 @@ class ViewManager:
                         b64_data = base64.b64encode(anexo_email_file.getvalue()).decode('utf-8')
                         anexo_email_data = {"file_name": anexo_email_file.name, "content_type": anexo_email_file.type, "b64_data": b64_data}
                     try:
-                        pedido = Pedido(requisicao_id=rc_data['id'], solicitante=rc_data['solicitante'], valor=rc_data['valor'], numero_pedido=numero_pedido, email_notificacao=email_notificacao_str or None, anexo_email=anexo_email_data)
+                        valor_final_pedido = parse_brazilian_float(valor_final_str)
+                        if valor_final_pedido <= 0:
+                            st.error("O valor final do pedido deve ser maior que zero."); return
+                        pedido = Pedido(requisicao_id=rc_data['id'], solicitante=rc_data['solicitante'], valor=valor_final_pedido, numero_pedido=numero_pedido, email_notificacao=email_notificacao_str or None, anexo_email=anexo_email_data)
                         pedido_data = pedido.model_dump(); pedido_data['historico'] = [f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
                         update_rc_data = {"status": "Pedido Gerado", "updated_at": datetime.now()}
                         if self.db.add_and_update_atomically("pedidos", pedido_data, "requisicoes", rc_data['id'], update_rc_data):
-                            self.db.log_action("Pedido Created", st.session_state.username, {"rc_id": rc_data['id'], "numero_pedido": numero_pedido})
+                            self.db.log_action("Pedido Created", st.session_state.username, {"rc_id": rc_data['id'], "numero_pedido": numero_pedido, "valor": valor_final_pedido})
                             st.toast("Pedido gerado!", icon="🚀"); st.session_state.generate_pedido_from_rc = None; time.sleep(1); st.rerun()
                     except ValidationError as e: st.error(f"Erro de validação, verifique os campos. Detalhes: {e}")
+                    except ValueError: pass
         if st.button("Cancelar"): st.session_state.generate_pedido_from_rc = None; st.rerun()
 
     def render_edit_modal(self):
