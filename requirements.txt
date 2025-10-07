@@ -6,3 +6,4 @@ openpyxl
 pydantic
 bleach
 requests
+pydantic[email]
