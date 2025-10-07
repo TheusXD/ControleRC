@@ -109,6 +109,15 @@ class User(BaseModel):
     permissions: List[str] = Field(default_factory=list)
 
 
+class SolicitacaoCadastro(BaseModel):
+    solicitante: str = Field(...)
+    descricao: str = Field(..., min_length=5)
+    status: str = Field(default="Cadastrando")
+    codigo_item_final: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
 # -----------------------------------------------------------------------------
 # 2. SERVICES (LÓGICA DE NEGÓCIOS E ACESSO A DADOS)
 # -----------------------------------------------------------------------------
@@ -467,7 +476,7 @@ class ViewManager:
         defaults = {'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'user_data': {}, 'confirm_delete': {}, 'edit_id': None,
                     'edit_user_id': None, 'confirm_delete_user': {}, 'reset_password_for_user': {}, 'focus_item': None, 'view_history_id': None,
                     'generate_pedido_from_rc': None, 'confirm_restore': None, 'show_notifications': False, 'notifications_list': [],
-                    'editing_comment': None, 'confirm_delete_comment': None}
+                    'editing_comment': None, 'confirm_delete_comment': None, 'concluir_cadastro_id': None}
         for key, value in defaults.items():
             if key not in st.session_state: st.session_state[key] = value
 
@@ -547,18 +556,20 @@ class ViewManager:
         else:
             col1, col2 = st.columns([0.8, 0.2]); col1.title("🚀 Sistema de Controle de Compras");
             with col2: self.render_notification_bell()
-            tabs = ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos"]
+            tabs = ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos", "📜 Controle de Cadastros"]
             if st.session_state.role == 'admin': tabs.append("🛡️ Registros de Atividades")
             selected_tabs = st.tabs(tabs)
             with selected_tabs[0]: self.render_dashboard()
             with selected_tabs[1]: self.render_demandas()
             with selected_tabs[2]: self.render_requisicoes()
             with selected_tabs[3]: self.render_pedidos()
+            with selected_tabs[4]: self.render_controle_cadastro()
             if st.session_state.role == 'admin':
-                with selected_tabs[4]: self.render_logs_tab()
+                with selected_tabs[5]: self.render_logs_tab()
         if st.session_state.view_history_id: self.render_history_modal()
         if st.session_state.generate_pedido_from_rc: self.render_generate_pedido_modal()
         if st.session_state.get('show_notifications', False): self.render_notifications_modal()
+        if st.session_state.get('concluir_cadastro_id'): self.render_concluir_cadastro_modal()
 
     def render_sidebar(self):
         with st.sidebar:
@@ -934,6 +945,64 @@ class ViewManager:
                     st.download_button("📥 Exportar para Excel", to_excel(df_for_export, f"Pedidos {statuses[0]}"), f'pedidos_{statuses[0].lower().replace(" ", "_")}.xlsx', key=f'btn_export_{statuses[0]}')
                 st.divider()
                 self._render_paginated_rows(final_filtered_pedidos, self.render_data_row, f"pedidos_{statuses[0]}", collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas, all_users=all_users)
+
+    def render_controle_cadastro(self):
+        st.header("📜 Controle de Cadastro de Itens")
+        with st.expander("➕ Solicitar Novo Cadastro de Item"):
+            with st.form("solicitacao_cadastro_form", clear_on_submit=True):
+                descricao = st.text_area("Descrição do item a ser cadastrado")
+                if st.form_submit_button("Enviar Solicitação", type="primary"):
+                    if not descricao or len(descricao) < 5:
+                        st.warning("A descrição é obrigatória e deve ter pelo menos 5 caracteres.")
+                    else:
+                        nova_solicitacao = SolicitacaoCadastro(solicitante=st.session_state.username, descricao=descricao)
+                        if self.db.add_doc("solicitacoes_cadastro", nova_solicitacao.model_dump()):
+                            st.success("Solicitação de cadastro enviada!")
+                            time.sleep(1); st.rerun()
+        st.divider()
+        tab_cadastrando, tab_concluido = st.tabs(["⏳ Cadastrando", "✅ Concluído"])
+        with tab_cadastrando:
+            df_cadastrando = self.db.get_docs("solicitacoes_cadastro", [("status", "==", "Cadastrando")])
+            if df_cadastrando.empty:
+                st.info("Nenhuma solicitação de cadastro pendente.")
+            else:
+                for _, item in df_cadastrando.iterrows():
+                    with st.container(border=True):
+                        st.write(f"**Solicitante:** {item['solicitante']} em {item['created_at'].strftime('%d/%m/%Y')}")
+                        st.info(item['descricao'])
+                        if st.button("Concluir Cadastro", key=f"concluir_{item['id']}", type="primary"):
+                            st.session_state.concluir_cadastro_id = item.to_dict()
+                            st.rerun()
+        with tab_concluido:
+            df_concluido = self.db.get_docs("solicitacoes_cadastro", [("status", "==", "Concluído")])
+            if df_concluido.empty:
+                st.info("Nenhum item concluído.")
+            else:
+                for _, item in df_concluido.iterrows():
+                    with st.container(border=True):
+                        st.write(f"**Solicitante:** {item['solicitante']} | **Concluído em:** {item['updated_at'].strftime('%d/%m/%Y')}")
+                        st.caption(f"**Descrição Original:** {item['descricao']}")
+                        st.success(f"**Código do Item Cadastrado:** `{item['codigo_item_final']}`")
+
+    @st.dialog("Concluir Cadastro de Item")
+    def render_concluir_cadastro_modal(self):
+        item_data = st.session_state.concluir_cadastro_id
+        st.write("Descrição do item:")
+        st.info(item_data['descricao'])
+        codigo_final = st.text_input("Digite o código do item que foi cadastrado no sistema:")
+        col1, col2 = st.columns(2)
+        if col1.button("Salvar e Concluir", type="primary"):
+            if not codigo_final:
+                st.error("O código do item é obrigatório para concluir.")
+            else:
+                update_data = {"status": "Concluído", "codigo_item_final": codigo_final, "updated_at": datetime.now()}
+                if self.db.update_doc("solicitacoes_cadastro", item_data['id'], update_data, st.session_state.username):
+                    st.toast("Cadastro concluído com sucesso!")
+                    st.session_state.concluir_cadastro_id = None
+                    st.rerun()
+        if col2.button("Cancelar"):
+            st.session_state.concluir_cadastro_id = None
+            st.rerun()
 
     def _format_comment_text(self, text: str, all_users_df: pd.DataFrame) -> str:
         if not isinstance(text, str): return ""
