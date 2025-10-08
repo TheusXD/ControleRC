@@ -116,6 +116,7 @@ class SolicitacaoCadastro(BaseModel):
     codigo_item_final: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+    comentarios: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -961,28 +962,60 @@ class ViewManager:
                             time.sleep(1); st.rerun()
         st.divider()
         tab_cadastrando, tab_concluido = st.tabs(["⏳ Cadastrando", "✅ Concluído"])
+        all_users = self.db.get_docs("users")
         with tab_cadastrando:
             df_cadastrando = self.db.get_docs("solicitacoes_cadastro", [("status", "==", "Cadastrando")])
+            if not df_cadastrando.empty:
+                st.download_button("📥 Exportar para Excel", to_excel(df_cadastrando, "Cadastros Pendentes"), 'cadastros_pendentes.xlsx')
             if df_cadastrando.empty:
                 st.info("Nenhuma solicitação de cadastro pendente.")
             else:
                 for _, item in df_cadastrando.iterrows():
-                    with st.container(border=True):
-                        st.write(f"**Solicitante:** {item['solicitante']} em {item['created_at'].strftime('%d/%m/%Y')}")
-                        st.info(item['descricao'])
-                        if st.button("Concluir Cadastro", key=f"concluir_{item['id']}", type="primary"):
-                            st.session_state.concluir_cadastro_id = item.to_dict()
-                            st.rerun()
+                    self._render_solicitacao_cadastro_row(item, all_users)
         with tab_concluido:
             df_concluido = self.db.get_docs("solicitacoes_cadastro", [("status", "==", "Concluído")])
+            if not df_concluido.empty:
+                st.download_button("📥 Exportar para Excel", to_excel(df_concluido, "Cadastros Concluídos"), 'cadastros_concluidos.xlsx')
             if df_concluido.empty:
                 st.info("Nenhum item concluído.")
             else:
                 for _, item in df_concluido.iterrows():
-                    with st.container(border=True):
-                        st.write(f"**Solicitante:** {item['solicitante']} | **Concluído em:** {item['updated_at'].strftime('%d/%m/%Y')}")
-                        st.caption(f"**Descrição Original:** {item['descricao']}")
-                        st.success(f"**Código do Item Cadastrado:** `{item['codigo_item_final']}`")
+                    self._render_solicitacao_cadastro_row(item, all_users)
+
+    def _render_solicitacao_cadastro_row(self, item_row, all_users):
+        """Renderiza uma única linha de solicitação de cadastro com ações."""
+        collection = "solicitacoes_cadastro"
+        item_id = item_row['id']
+        key = f"{collection}_{item_id}"
+        with st.container(border=True):
+            if item_row['status'] == 'Concluído':
+                st.write(f"**Solicitante:** {item_row['solicitante']} | **Concluído em:** {item_row['updated_at'].strftime('%d/%m/%Y')}")
+                st.caption(f"**Descrição Original:** {item_row['descricao']}")
+                st.success(f"**Código do Item Cadastrado:** `{item_row['codigo_item_final']}`")
+            else:
+                st.write(f"**Solicitante:** {item_row['solicitante']} em {item_row['created_at'].strftime('%d/%m/%Y')}")
+                st.info(item_row['descricao'])
+            cols = st.columns([1, 1, 2, 6])
+            with cols[0]:
+                st.button("✏️", key=f"edit_{key}", help="Editar Descrição", on_click=self._set_edit_state, args=(collection, item_row.to_dict()))
+            with cols[1]:
+                st.button("🗑️", key=f"del_{key}", help="Excluir Solicitação", on_click=self._set_delete_state, args=(collection, item_id, item_row['descricao']))
+            if item_row['status'] == 'Cadastrando':
+                with cols[2]:
+                    if st.button("Concluir Cadastro", key=f"concluir_{key}", type="primary"):
+                        st.session_state.concluir_cadastro_id = item_row.to_dict()
+                        st.rerun()
+            if st.session_state.confirm_delete.get('id') == item_id:
+                st.warning(f"Excluir solicitação '{st.session_state.confirm_delete['desc']}'?")
+                c1, c2, _ = st.columns([1, 1, 8])
+                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
+                    self.db.delete_doc(collection, item_id)
+                    self.db.log_action("Solicitação de Cadastro Excluída", st.session_state.username, {"doc_id": item_id})
+                    st.session_state.confirm_delete = {}; st.rerun()
+                if c2.button("Cancelar", key=f"canc_del_{key}"):
+                    st.session_state.confirm_delete = {}; st.rerun()
+            with st.expander("💬 Comentários"):
+                self._render_comments_section(item_row, collection, all_users=all_users)
 
     @st.dialog("Concluir Cadastro de Item")
     def render_concluir_cadastro_modal(self):
@@ -1180,6 +1213,8 @@ class ViewManager:
                 data_entrega_input = st.date_input("Data de Entrega", value=entrega_val)
                 new_data['data_entrega'] = datetime.combine(data_entrega_input, datetime.min.time()) if data_entrega_input else None
                 new_data['observacao'] = st.text_area("Observação", data.get('observacao', ''))
+            elif edit_info['collection'] == 'solicitacoes_cadastro':
+                new_data['descricao'] = st.text_area("Descrição do item a ser cadastrado", data.get('descricao', ''))
             c1, c2 = st.columns(2)
             if c1.form_submit_button("Salvar", type="primary"):
                 try:
