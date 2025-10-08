@@ -92,7 +92,7 @@ class Pedido(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.now)
     observacao: Optional[str] = Field(default=None)
     data_entrega: Optional[datetime] = Field(default=None)
-    email_notificacao: Optional[EmailStr] = Field(default=None)
+    email_notificacao: Optional[str] = Field(default=None)
     anexo_email: Optional[Dict[str, str]] = Field(default=None)
     historico: List[str] = Field(default_factory=list)
     comentarios: List[Dict[str, Any]] = Field(default_factory=list)
@@ -1174,7 +1174,22 @@ class ViewManager:
                         valor_final_pedido = parse_brazilian_float(valor_final_str)
                         if valor_final_pedido <= 0:
                             st.error("O valor final do pedido deve ser maior que zero."); return
-                        pedido = Pedido(requisicao_id=rc_data['id'], solicitante=rc_data['solicitante'], valor=valor_final_pedido, numero_pedido=numero_pedido, email_notificacao=email_notificacao_str or None, anexo_email=anexo_email_data)
+                        emails_para_notificar_lista = []
+                        if email_notificacao_str:
+                            # 1. Cria a lista de e-mails a partir da string de entrada
+                            lista_bruta = re.split(r'[;, \n]+', email_notificacao_str)
+                            emails_para_notificar_lista = [email.strip() for email in lista_bruta if email.strip()]
+
+                        # 2. Converte a lista em uma string única, separada por vírgulas
+                        emails_para_notificar_string = ", ".join(emails_para_notificar_lista)
+
+                        # 3. Cria o pedido passando a STRING, que é o que o modelo e a Cloud Function esperam agora
+                        pedido = Pedido(requisicao_id=rc_data['id'],
+                                        solicitante=rc_data['solicitante'],
+                                        valor=valor_final_pedido,
+                                        numero_pedido=numero_pedido,
+                                        email_notificacao=emails_para_notificar_string or None,
+                                        anexo_email=anexo_email_data)
                         pedido_data = pedido.model_dump(); pedido_data['historico'] = [f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
                         update_rc_data = {"status": "Pedido Gerado", "updated_at": datetime.now()}
                         if self.db.add_and_update_atomically("pedidos", pedido_data, "requisicoes", rc_data['id'], update_rc_data):
