@@ -2,28 +2,18 @@
  * Este código utiliza a sintaxe V2 do Firebase Functions, que é a mais moderna.
  */
 const {onDocumentCreated} = require("firebase-functions/v2/firestore");
+const functions = require("firebase-functions"); // <-- 1. ADICIONADO PARA ACESSAR CONFIG
 const {initializeApp} = require("firebase-admin/app");
 const {getFirestore} = require("firebase-admin/firestore");
 const nodemailer = require("nodemailer");
 const logger = require("firebase-functions/logger");
 
-// Carrega as variáveis de ambiente do arquivo .env.production
-require("dotenv").config({ path: '.env.production' });
+// A linha 'require("dotenv").config(...);' foi REMOVIDA.
 
 // Inicializa o app do Firebase Admin
 initializeApp();
 
-// --- Configuração do Transportador de E-mail ---
-const gmailEmail = process.env.GMAIL_EMAIL;
-const gmailPassword = process.env.GMAIL_PASSWORD;
-
-const mailTransport = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: gmailEmail,
-    pass: gmailPassword,
-  },
-});
+// A configuração do mailTransport foi MOVIDA para dentro da função.
 
 /**
  * Cloud Function que é acionada sempre que um novo documento é criado
@@ -37,7 +27,26 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
     }
     const novoPedido = snap.data();
 
-    // --- LÓGICA ATUALIZADA PARA MÚLTIPLOS E-MAILS E ANEXOS ---
+    // --- LÓGICA DE CONFIGURAÇÃO DO E-MAIL (AGORA DENTRO DA FUNÇÃO) ---
+    // 2. Busca as credenciais da configuração segura do Firebase
+    const gmailEmail = functions.config().gmail.email;
+    const gmailPassword = functions.config().gmail.password;
+
+    // Validação para garantir que as credenciais foram carregadas
+    if (!gmailEmail || !gmailPassword) {
+        logger.error("Credenciais de e-mail não encontradas na configuração do Firebase. Verifique se executou 'firebase functions:config:set gmail.email' e 'gmail.password'.");
+        return;
+    }
+
+    const mailTransport = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: gmailEmail,
+        pass: gmailPassword,
+      },
+    });
+    // --- FIM DA LÓGICA DE CONFIGURAÇÃO ---
+
     const emailsString = novoPedido.email_notificacao;
 
     if (!emailsString || emailsString.trim() === "") {
@@ -45,7 +54,6 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         return;
     }
 
-    // Separa a string de e-mails em uma lista, removendo espaços em branco
     const emailList = emailsString.split(',').map(email => email.trim()).filter(email => email);
 
     if (emailList.length === 0) {
@@ -74,10 +82,9 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
         const descricaoDemanda = demandaData.descricao_necessidade;
         const solicitanteUsername = demandaData.solicitante_demanda;
 
-        // Montar o objeto de opções do e-mail
         const mailOptions = {
             from: `"Sistema de Compras" <${gmailEmail}>`,
-            to: emailList.join(", "), // Nodemailer aceita uma string de e-mails separados por vírgula
+            to: emailList.join(", "),
             subject: `✅ Novo Pedido Gerado: ${numeroPedido}`,
             html: `
             <p>Olá!</p>
@@ -95,10 +102,9 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated("pedidos/{pedidoId}", as
             <p>Você pode acompanhar o status do pedido através do sistema.</p>
             <p><em>Esta é uma mensagem automática, por favor, não responda.</em></p>
           `,
-          attachments: [] // Inicializa a lista de anexos
+          attachments: []
         };
 
-        // Adicionar anexo ao e-mail, se existir
         if (novoPedido.anexo_email && novoPedido.anexo_email.b64_data) {
             mailOptions.attachments.push({
                 filename: novoPedido.anexo_email.file_name,
