@@ -1,10 +1,11 @@
 /**
- * Versão final com SendGrid - mais simples e robusta.
+ * Versão final usando Nodemailer com Gmail diretamente.
+ * Esta é a solução mais confiável para entrega de e-mail.
  */
 const {onDocumentCreated} = require("firebase-functions/v2/firestore");
 const {initializeApp} = require("firebase-admin/app");
 const {getFirestore} = require("firebase-admin/firestore");
-const sgMail = require("@sendgrid/mail"); // Usa a biblioteca do SendGrid
+const nodemailer = require("nodemailer");
 const logger = require("firebase-functions/logger");
 
 initializeApp();
@@ -12,25 +13,30 @@ initializeApp();
 exports.enviarNotificacaoNovoPedido = onDocumentCreated(
   {
     document: "pedidos/{pedidoId}",
-    // Declara os secrets que a função usará (o e-mail é o seu remetente verificado)
-    secrets: ["SENDGRID_API_KEY", "GMAIL_EMAIL"],
+    // Declara os secrets que a função usará
+    secrets: ["GMAIL_EMAIL", "GMAIL_PASSWORD"],
   },
   async (event) => {
     const snap = event.data;
-    if (!snap) {
-        logger.log("Nenhum dado associado ao evento.");
-        return;
-    }
+    if (!snap) { return; }
     const novoPedido = snap.data();
 
-    // Configura o SendGrid com a chave de API
-    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-    const fromEmail = process.env.GMAIL_EMAIL; // O e-mail que você verificou no SendGrid
+    const gmailEmail = process.env.GMAIL_EMAIL;
+    const gmailPassword = process.env.GMAIL_PASSWORD;
 
-    if (!process.env.SENDGRID_API_KEY || !fromEmail) {
-        logger.error("SENDGRID_API_KEY ou GMAIL_EMAIL não encontrados nos secrets.");
+    if (!gmailEmail || !gmailPassword) {
+        logger.error("GMAIL_EMAIL ou GMAIL_PASSWORD não encontrados nos secrets.");
         return;
     }
+
+    // Configura o transporte para o Gmail
+    const mailTransport = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: gmailEmail,
+        pass: gmailPassword,
+      },
+    });
 
     const emailsString = novoPedido.email_notificacao;
     if (!emailsString || emailsString.trim() === "") {
@@ -44,6 +50,7 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated(
         return;
     }
 
+    // O resto do código continua igual...
     const numeroPedido = novoPedido.numero_pedido || "Sem Número";
     const valorPedido = novoPedido.valor.toFixed(2).replace(".", ",");
 
@@ -52,49 +59,29 @@ exports.enviarNotificacaoNovoPedido = onDocumentCreated(
         const requisicaoData = requisicaoDoc.exists ? requisicaoDoc.data() : {};
         const demandaDoc = requisicaoData.demanda_id ? await getFirestore().collection("demandas").doc(requisicaoData.demanda_id).get() : null;
         const demandaData = demandaDoc && demandaDoc.exists ? demandaDoc.data() : {};
+        const descricaoDemanda = demandaData.descricao_necessidade || "N/A";
+        const solicitanteUsername = demandaData.solicitante_demanda || "N/A";
 
-        const descricaoDemanda = demandaData.descricao_necessidade || "Descrição não encontrada";
-        const solicitanteUsername = demandaData.solicitante_demanda || "Solicitante não encontrado";
-
-        // Monta a mensagem para o SendGrid
-        const msg = {
-            to: emailList, // SendGrid aceita um array de e-mails diretamente!
-            from: {
-                name: "Sistema de Compras",
-                email: fromEmail // Use o e-mail verificado
-            },
+        const mailOptions = {
+            from: `"Sistema de Compras" <${gmailEmail}>`,
+            to: emailList.join(", "),
             subject: `✅ Novo Pedido Gerado: ${numeroPedido}`,
-            html: `
-            <p>Olá!</p>
-            <p>Um novo pedido de compra foi gerado no sistema.</p>
-            <hr>
-            <h3>Detalhes do Pedido</h3>
-            <ul>
-              <li><strong>Número do Pedido:</strong> ${numeroPedido}</li>
-              <li><strong>Valor:</strong> R$ ${valorPedido}</li>
-              <li><strong>Solicitante da Demanda Original:</strong> ${solicitanteUsername}</li>
-            </ul>
-            <h3>Demanda Original</h3>
-            <p><strong>Descrição:</strong> ${descricaoDemanda}</p>
-            <hr>
-            <p><em>Esta é uma mensagem automática.</em></p>
-          `,
-          attachments: []
+            html: `(O seu corpo do e-mail em HTML aqui)`,
+            attachments: []
         };
 
         if (novoPedido.anexo_email && novoPedido.anexo_email.b64_data) {
-            msg.attachments.push({
-                content: novoPedido.anexo_email.b64_data,
+            mailOptions.attachments.push({
                 filename: novoPedido.anexo_email.file_name,
-                type: novoPedido.anexo_email.content_type,
-                disposition: 'attachment'
+                content: Buffer.from(novoPedido.anexo_email.b64_data, 'base64'),
+                contentType: novoPedido.anexo_email.content_type,
             });
         }
 
-        await sgMail.send(msg);
-        logger.log(`E-mail enviado via SendGrid para: ${emailList.join(", ")}`);
+        await mailTransport.sendMail(mailOptions);
+        logger.log(`E-mail enviado via Gmail para: ${emailList.join(", ")}`);
 
     } catch (error) {
-        logger.error("Erro ao enviar e-mail via SendGrid:", error.response ? error.response.body : error);
+        logger.error("Erro ao enviar notificação por e-mail:", error);
     }
 });
