@@ -870,37 +870,90 @@ class ViewManager:
 
     def render_dashboard(self):
         st.header("📊 Dashboard de Métricas")
+
+        # 1. Carrega TODOS os dados brutos do banco
+        df_demandas = self.db.get_docs("demandas")
+        df_rc = self.db.get_docs("requisicoes")
+        df_pedidos = self.db.get_docs("pedidos")
+
+        # 2. Lógica para identificar os Anos Disponíveis
+        anos_disponiveis = set()
+        current_year = datetime.now().year
+
+        # Verifica anos nas demandas
+        if not df_demandas.empty and 'created_at' in df_demandas.columns:
+            anos_disponiveis.update(df_demandas['created_at'].dt.year.unique())
+
+        # Verifica anos nas requisições
+        if not df_rc.empty and 'created_at' in df_rc.columns:
+            anos_disponiveis.update(df_rc['created_at'].dt.year.unique())
+
+        # Adiciona o ano atual (para garantir que ele apareça mesmo se não houver dados ainda)
+        anos_disponiveis.add(current_year)
+
+        # Transforma em lista ordenada
+        lista_anos = sorted(list(anos_disponiveis), reverse=True)
+
+        # 3. Cria o Seletor de Ano na tela (Padrão: Ano Atual)
+        c_filtro, _ = st.columns([1, 3])
+        with c_filtro:
+            ano_selecionado = st.selectbox("📅 Selecione o Ano de Referência", lista_anos, index=0)
+
+        # 4. Filtra os DataFrames com base no ano selecionado
+        # Se o dataframe não estiver vazio, filtra pelo ano. Se estiver vazio, mantém vazio.
+        df_demandas_ano = df_demandas[
+            df_demandas['created_at'].dt.year == ano_selecionado] if not df_demandas.empty else df_demandas
+        df_rc_ano = df_rc[df_rc['created_at'].dt.year == ano_selecionado] if not df_rc.empty else df_rc
+        df_pedidos_ano = df_pedidos[
+            df_pedidos['created_at'].dt.year == ano_selecionado] if not df_pedidos.empty else df_pedidos
+
+        # --- A PARTIR DAQUI, USAMOS APENAS OS DATAFRAMES FILTRADOS (_ano) ---
+
         self.render_tutorial()
-        df_demandas, df_rc, df_pedidos = self.db.get_docs("demandas"), self.db.get_docs(
-            "requisicoes"), self.db.get_docs("pedidos")
+
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total de Demandas", f"{len(df_demandas)} 📝")
-        c2.metric("Total de RCs", f"{len(df_rc)} 🛒")
-        c3.metric("Total de Pedidos", f"{len(df_pedidos)} 🚚")
-        c4.metric("Valor Total em RCs", format_brazilian_currency(df_rc['valor'].sum() if not df_rc.empty else 0))
-        valor_total_pedidos = df_pedidos['valor'].sum() if not df_pedidos.empty else 0
-        c5.metric("Valor Total em Pedidos", format_brazilian_currency(valor_total_pedidos))
+        c1.metric(f"Demandas ({ano_selecionado})", f"{len(df_demandas_ano)} 📝")
+        c2.metric(f"RCs ({ano_selecionado})", f"{len(df_rc_ano)} 🛒")
+        c3.metric(f"Pedidos ({ano_selecionado})", f"{len(df_pedidos_ano)} 🚚")
+
+        valor_total_rc = df_rc_ano['valor'].sum() if not df_rc_ano.empty else 0
+        c4.metric("Valor em RCs", format_brazilian_currency(valor_total_rc))
+
+        valor_total_pedidos = df_pedidos_ano['valor'].sum() if not df_pedidos_ano.empty else 0
+        c5.metric("Valor em Pedidos", format_brazilian_currency(valor_total_pedidos))
+
         st.divider()
+
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("Status das Demandas")
-            if not df_demandas.empty:
-                status_counts = df_demandas['status_demanda'].value_counts().reset_index()
-                fig = px.bar(status_counts, x='status_demanda', y='count', title="Distribuição de Status",
-                             text_auto=True, color='status_demanda',
+            st.subheader(f"Status das Demandas - {ano_selecionado}")
+            if not df_demandas_ano.empty:
+                status_counts = df_demandas_ano['status_demanda'].value_counts().reset_index()
+                # Ajuste para versão mais recente do Pandas/Plotly (nomes das colunas podem variar)
+                status_counts.columns = ['status_demanda', 'count']
+
+                fig = px.bar(status_counts, x='status_demanda', y='count',
+                             title=f"Distribuição de Status em {ano_selecionado}",
+                             text_auto=True,
+                             color='status_demanda',
                              labels={'status_demanda': 'Status', 'count': 'Quantidade'})
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("Nenhuma demanda para exibir.")
+                st.info(f"Nenhuma demanda registrada em {ano_selecionado}.")
+
         with c2:
-            st.subheader("Demandas por Categoria")
-            if not df_demandas.empty:
-                cat_counts = df_demandas['categoria'].value_counts().reset_index()
-                fig = px.pie(cat_counts, names='categoria', values='count', title="Distribuição por Categoria", hole=.3,
+            st.subheader(f"Demandas por Categoria - {ano_selecionado}")
+            if not df_demandas_ano.empty:
+                cat_counts = df_demandas_ano['categoria'].value_counts().reset_index()
+                cat_counts.columns = ['categoria', 'count']
+
+                fig = px.pie(cat_counts, names='categoria', values='count',
+                             title=f"Distribuição por Categoria em {ano_selecionado}",
+                             hole=.3,
                              labels={'categoria': 'Categoria', 'count': 'Quantidade'})
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("Nenhuma categoria para exibir.")
+                st.info(f"Nenhuma categoria registrada em {ano_selecionado}.")
 
     def render_tutorial(self):
         with st.expander("💡 Mini-Tutorial: Como Usar o Sistema", expanded=False):
