@@ -20,6 +20,29 @@ import uuid
 import bleach
 import requests
 
+@st.cache_resource
+def get_db_service(creds):
+    """Cria a conexão com o banco apenas uma vez."""
+    return FirebaseService(creds)
+
+@st.cache_data(ttl=300)  # Cache de 5 minutos para tabelas gerais
+def get_cached_docs(_db_service, collection_name):
+    """Lê dados do banco e guarda na memória."""
+    # O underline (_) no nome do argumento evita erro de hash do Streamlit
+    return _db_service.get_docs(collection_name)
+
+@st.cache_data(ttl=600)  # Cache de 10 minutos para lista de usuários
+def get_cached_users_list(_db_service):
+    """Carrega a lista de usuários apenas uma vez a cada 10 min."""
+    df = get_cached_docs(_db_service, "users")
+    if not df.empty and 'username' in df.columns:
+        return ["Ninguém"] + sorted(df['username'].unique().tolist())
+    return ["Ninguém"]
+
+def clear_cache():
+    """Limpa a memória para mostrar dados novos após salvar."""
+    st.cache_data.clear()
+
 # Configurar o logging para monitorizar a aplicação
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -176,6 +199,7 @@ class FirebaseService:
         """ Adiciona um documento e retorna seu ID em caso de sucesso. """
         try:
             _, new_doc_ref = self.db.collection(collection).add(data)
+            clear_cache()  # <--- ADICIONADO: Limpa cache após criar
             return new_doc_ref.id
         except Exception as e:
             logger.error(f"Erro ao adicionar documento a '{collection}': {e}", exc_info=True)
@@ -215,6 +239,7 @@ class FirebaseService:
             if 'historico' in old_data: new_data['historico'] = history_log
             new_data['updated_at'] = datetime.now()
             doc_ref.update(new_data)
+            clear_cache()
             return True
         except Exception as e:
             logger.error(f"Erro ao atualizar documento ID: {doc_id} em '{collection}': {e}", exc_info=True)
@@ -224,6 +249,7 @@ class FirebaseService:
     def delete_doc(self, collection: str, doc_id: str) -> bool:
         try:
             self.db.collection(collection).document(doc_id).delete();
+            clear_cache()
             return True
         except Exception as e:
             logger.error(f"Erro ao excluir documento ID: {doc_id} de '{collection}': {e}", exc_info=True)
@@ -236,6 +262,7 @@ class FirebaseService:
             _atomic_add_and_update_standalone(
                 transaction, self.db, add_col, add_data, update_col, update_id, update_data
             )
+            clear_cache()
             return True
         except ValueError as e:
             logger.error(f"Falha na transação atômica (ValueError): {e}", exc_info=True)
@@ -532,6 +559,7 @@ class ViewManager:
     def _init_session_state(self):
         defaults = {'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'user_data': {},
                     'confirm_delete': {}, 'edit_id': None,
+                    'ignored_notifications': set(),  # <--- ADICIONE ISSO (conjunto para performance)
                     'edit_user_id': None, 'confirm_delete_user': {}, 'reset_password_for_user': {}, 'focus_item': None,
                     'view_history_id': None,
                     'generate_pedido_from_rc': None, 'confirm_restore': None, 'show_notifications': False,
@@ -705,36 +733,44 @@ class ViewManager:
             if rc2.button("Cancelar", key="canc_restore_l"): del st.session_state.confirm_restore; st.rerun()
 
     def _render_user_lists(self):
-        pending_users = self.db.get_docs("users", [("status", "==", "pending")])
+        # OTIMIZAÇÃO: Busca todos os usuários do cache de uma vez só
+        all_users = get_cached_docs(self.db, "users")
+
+        # Filtra PENDENTES na memória
+        pending_users = all_users[all_users["status"] == "pending"] if not all_users.empty else pd.DataFrame()
+
         if not pending_users.empty:
             st.subheader("Aprovações Pendentes")
             for _, user in pending_users.iterrows():
-                c1, c2, c3 = st.columns([2, 1, 1]);
+                c1, c2, c3 = st.columns([2, 1, 1])
                 c1.write(f"{user['username']} ({user['role']})")
                 if c2.button("✅", key=f"a_{user['id']}", help="Aprovar"):
                     self.db.update_doc("users", user['id'], {"status": "active"}, st.session_state.username)
-                    self.db.log_action("User Approved", st.session_state.username, {"approved_user": user['username']});
+                    self.db.log_action("User Approved", st.session_state.username, {"approved_user": user['username']})
                     st.rerun()
                 if c3.button("🗑️", key=f"r_{user['id']}", help="Rejeitar"):
                     self.db.delete_doc("users", user['id'])
-                    self.db.log_action("User Rejected", st.session_state.username, {"rejected_user": user['username']});
+                    self.db.log_action("User Rejected", st.session_state.username, {"rejected_user": user['username']})
                     st.rerun()
             st.divider()
+
+        # Filtra ATIVOS na memória
         st.subheader("Usuários Ativos")
-        active_users = self.db.get_docs("users", [("status", "==", "active")])
+        active_users = all_users[all_users["status"] == "active"] if not all_users.empty else pd.DataFrame()
+
         for _, user in active_users.iterrows():
             is_self = user['username'] == st.session_state.username
             c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
             c1.write(f"**{user['username']}** ({user.get('email', 'sem e-mail')}) - `{user['role']}`")
-            if c2.button("✏️", key=f"edit_user_{user['id']}", help="Editar"): st.session_state.edit_user_id = user[
-                'id']; st.rerun()
-            if c3.button("🔑", key=f"reset_pw_{user['id']}", help="Redefinir Senha",
-                         disabled=is_self): st.session_state.reset_password_for_user = {'id': user['id'],
-                                                                                        'username': user[
-                                                                                            'username']}; st.rerun()
-            if c4.button("🗑️", key=f"del_user_{user['id']}", help="Excluir",
-                         disabled=is_self): st.session_state.confirm_delete_user = {'id': user['id'], 'username': user[
-                'username']}; st.rerun()
+            if c2.button("✏️", key=f"edit_user_{user['id']}", help="Editar"):
+                st.session_state.edit_user_id = user['id']
+                st.rerun()
+            if c3.button("🔑", key=f"reset_pw_{user['id']}", help="Redefinir Senha", disabled=is_self):
+                st.session_state.reset_password_for_user = {'id': user['id'], 'username': user['username']}
+                st.rerun()
+            if c4.button("🗑️", key=f"del_user_{user['id']}", help="Excluir", disabled=is_self):
+                st.session_state.confirm_delete_user = {'id': user['id'], 'username': user['username']}
+                st.rerun()
 
     def _render_edit_user_form(self):
         user_data = self.db.get_doc("users", st.session_state.edit_user_id)
@@ -778,39 +814,43 @@ class ViewManager:
 
     def render_notification_bell(self):
         all_notifications = []
+
+        # Lógica de Admin (mantida)
         if st.session_state.role == 'admin':
-            pending_users = self.db.get_docs("users", [("status", "==", "pending")])
-            for _, user in pending_users.iterrows(): all_notifications.append(
-                {"id": f"admin_approval_{user['id']}", "message": f"Aprovação pendente: {user['username']}",
-                 "type": "admin_approval"})
-        user_notifications_df = self.db.get_docs("notifications",
-                                                 [("username", "==", st.session_state.username), ("read", "==", False)])
-        if not user_notifications_df.empty:
-            for _, notif in user_notifications_df.iterrows(): all_notifications.append(notif.to_dict())
+            all_users = get_cached_docs(self.db, "users")
+            if not all_users.empty:
+                pending_users = all_users[all_users['status'] == 'pending']
+                for _, user in pending_users.iterrows():
+                    notif_id = f"admin_approval_{user['id']}"
+                    # FILTRO NOVO: Só adiciona se não estiver na lista de ignorados
+                    if notif_id not in st.session_state.ignored_notifications:
+                        all_notifications.append({
+                            "id": notif_id,
+                            "message": f"Aprovação pendente: {user['username']}",
+                            "type": "admin_approval"
+                        })
+
+        # Notificações normais do Cache
+        all_notifs_df = get_cached_docs(self.db, "notifications")
+        if not all_notifs_df.empty:
+            user_notifications_df = all_notifs_df[
+                (all_notifs_df['username'] == st.session_state.username) &
+                (all_notifs_df['read'] == False)
+                ]
+            for _, notif in user_notifications_df.iterrows():
+                # FILTRO NOVO: Verifica se já marcamos como lida nesta sessão
+                if notif['id'] not in st.session_state.ignored_notifications:
+                    all_notifications.append(notif.to_dict())
+
         st.session_state.notifications_list = all_notifications
         num_notifications = len(all_notifications)
         label = f"🔔 ({num_notifications})" if num_notifications > 0 else "🔔"
-        if st.button(label, help="Notificações"): st.session_state.show_notifications = not st.session_state.get(
-            'show_notifications', False); st.rerun()
 
-    @st.dialog("🔔 Notificações")
-    def render_notifications_modal(self):
-        notifications = st.session_state.get('notifications_list', [])
-        if not notifications:
-            st.info("Nenhuma notificação nova.")
-        else:
-            for notif in notifications:
-                if notif.get('type') == 'admin_approval':
-                    st.warning(notif['message'])
-                else:
-                    if st.button(notif['message'], key=f"notif_{notif['id']}"):
-                        self.db.update_doc("notifications", notif['id'], {"read": True}, st.session_state.username)
-                        self.db.log_action("Notification Read", st.session_state.username,
-                                           {"notification_id": notif['id']})
-                        st.session_state.focus_item = notif['link'];
-                        st.session_state.show_notifications = False;
-                        st.rerun()
-        if st.button("Fechar"): st.session_state.show_notifications = False; st.rerun()
+        # Se clicar, abre o modal
+        if st.button(label, help="Notificações"):
+            st.session_state.show_notifications = not st.session_state.get('show_notifications', False)
+            # Apenas rerun simples, sem limpar cache
+            st.rerun()
 
     def _render_paginated_rows(self, df: pd.DataFrame, render_function, key_suffix: str, **kwargs):
         if df.empty:
@@ -855,14 +895,23 @@ class ViewManager:
         collection, doc_id = focus_info['collection'], focus_info['id']
         item_map = {"demandas": "Demanda", "requisicoes": "Requisição", "pedidos": "Pedido"}
         item_type = item_map.get(collection, collection[:-1]).capitalize()
+
         st.subheader(f"Navegação: {item_type}s > Visualizando {item_type}")
-        if st.button("⬅️ Voltar para a lista"): st.session_state.focus_item = None; st.rerun()
+        if st.button("⬅️ Voltar para a lista"):
+            st.session_state.focus_item = None
+            st.rerun()
+
+        # Busca o item específico (aqui usamos get_doc direto para garantir o dado mais fresco possível do item atual)
         doc_data = self.db.get_doc(collection, doc_id)
+
         if doc_data:
             row = pd.Series(doc_data)
-            all_users = self.db.get_docs("users")
-            all_demandas = self.db.get_docs("demandas") if collection != 'demandas' else None
-            all_rcs = self.db.get_docs("requisicoes") if collection == 'pedidos' else None
+
+            # OTIMIZAÇÃO: As tabelas auxiliares vêm do CACHE
+            all_users = get_cached_docs(self.db, "users")
+            all_demandas = get_cached_docs(self.db, "demandas") if collection != 'demandas' else None
+            all_rcs = get_cached_docs(self.db, "requisicoes") if collection == 'pedidos' else None
+
             self.render_data_row(row, collection=collection, all_demandas=all_demandas, all_rcs=all_rcs,
                                  all_users=all_users)
         else:
@@ -872,9 +921,9 @@ class ViewManager:
         st.header("📊 Dashboard de Métricas")
 
         # 1. Carrega TODOS os dados brutos do banco
-        df_demandas = self.db.get_docs("demandas")
-        df_rc = self.db.get_docs("requisicoes")
-        df_pedidos = self.db.get_docs("pedidos")
+        df_demandas = get_cached_docs(self.db, "demandas")
+        df_rc = get_cached_docs(self.db, "requisicoes")
+        df_pedidos = get_cached_docs(self.db, "pedidos")
 
         # 2. Lógica para identificar os Anos Disponíveis
         anos_disponiveis = set()
@@ -1006,11 +1055,11 @@ class ViewManager:
         if st.session_state.role in ['admin', 'user', 'gestor']:
             with st.expander("➕ Adicionar Nova Demanda"):
                 with st.form("demanda_form", clear_on_submit=True):
-                    all_users = self.db.get_docs("users");
-                    user_list = ["Ninguém"] + sorted(all_users['username'].unique().tolist())
+                    # OTIMIZAÇÃO: Usa lista de usuários do cache
+                    user_list = get_cached_users_list(self.db)
                     descricao, assigned_to = st.text_area("Descrição da Necessidade"), st.selectbox("Atribuir para:",
                                                                                                     user_list)
-                    c1, c2 = st.columns(2);
+                    c1, c2 = st.columns(2)
                     tipo = c1.selectbox("Tipo", ["Material", "Serviço"], index=None, placeholder="Selecione o tipo...")
                     categorias_fixas = ["Facilities/Eletromecânica", "Manutenção de rede", "Tratamento",
                                         "Tratamento (Laboratório)"]
@@ -1019,14 +1068,18 @@ class ViewManager:
                     uploaded_file = st.file_uploader("Anexo (Opcional, máx 750KB)",
                                                      type=['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'doc', 'docx',
                                                            'txt'])
+
                     if st.form_submit_button("Registrar Demanda", type="primary"):
-                        if not all([descricao, categoria, tipo]): st.error(
-                            "Preencha todos os campos obrigatórios (Descrição, Tipo e Categoria)."); return
+                        if not all([descricao, categoria, tipo]):
+                            st.error("Preencha todos os campos obrigatórios (Descrição, Tipo e Categoria).")
+                            return
                         with st.spinner("Registrando demanda..."):
                             anexo_data_dict = None
                             if uploaded_file:
                                 is_valid, validation_message = self._validate_uploaded_file(uploaded_file)
-                                if not is_valid: st.error(validation_message); return
+                                if not is_valid:
+                                    st.error(validation_message)
+                                    return
                                 b64_data = base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
                                 anexo_data_dict = {"file_name": uploaded_file.name, "content_type": uploaded_file.type,
                                                    "b64_data": b64_data, "file_size": uploaded_file.size}
@@ -1035,44 +1088,44 @@ class ViewManager:
                                                   descricao_necessidade=descricao, tipo=tipo, categoria=categoria,
                                                   anexo=anexo_data_dict,
                                                   assigned_to=assigned_to if assigned_to != "Ninguém" else None)
-                                demanda_data = demanda.model_dump();
+                                demanda_data = demanda.model_dump()
                                 demanda_data['historico'] = [
                                     f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
 
-                                new_demanda_id = self.db.add_doc("demandas", demanda_data)  # Agora retorna o ID
+                                new_demanda_id = self.db.add_doc("demandas", demanda_data)
                                 if new_demanda_id:
                                     self.db.log_action("Demanda Created", st.session_state.username,
                                                        {"doc_id": new_demanda_id, "description": descricao,
                                                         "assigned_to": assigned_to})
-
-                                    # --- LÓGICA DE NOTIFICAÇÃO ADICIONADA ---
                                     if assigned_to and assigned_to != "Ninguém":
-                                        self._create_assignment_notification(
-                                            assigned_user=assigned_to,
-                                            author=st.session_state.username,
-                                            collection="demandas",
-                                            doc_id=new_demanda_id,
-                                            description=descricao
-                                        )
-                                    # --- FIM DA LÓGICA ---
-
-                                    st.toast("✅ Demanda registrada!", icon="✅");
-                                    time.sleep(1);
+                                        self._create_assignment_notification(assigned_user=assigned_to,
+                                                                             author=st.session_state.username,
+                                                                             collection="demandas",
+                                                                             doc_id=new_demanda_id,
+                                                                             description=descricao)
+                                    st.toast("✅ Demanda registrada!", icon="✅")
+                                    time.sleep(1)
                                     st.rerun()
-
                             except ValidationError as e:
                                 st.error(f"Erro de validação: {e}")
+
             with st.expander("➕ Adicionar Múltiplas Demandas (via Planilha)"):
                 self._render_bulk_upload_section()
+
         st.header("Demandas Registradas")
-        df_demandas, df_rcs, df_pedidos, df_users = self.db.get_docs("demandas"), self.db.get_docs(
-            "requisicoes"), self.db.get_docs("pedidos"), self.db.get_docs("users")
+        # OTIMIZAÇÃO: Usa get_cached_docs para tudo
+        df_demandas = get_cached_docs(self.db, "demandas")
+        df_rcs = get_cached_docs(self.db, "requisicoes")
+        df_pedidos = get_cached_docs(self.db, "pedidos")
+        df_users = get_cached_docs(self.db, "users")
+
         filtered_demandas = self.render_advanced_filters(df_demandas, "demandas")
         if not filtered_demandas.empty:
             st.download_button(label="📥 Exportar para Excel", data=to_excel(filtered_demandas, "Demandas"),
                                file_name="demandas_exportadas.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                key="export_demandas")
+
         st.divider()
         self._render_paginated_rows(filtered_demandas, self.render_data_row, "demandas", collection="demandas",
                                     all_rcs=df_rcs, all_pedidos=df_pedidos, all_users=df_users)
@@ -1146,22 +1199,30 @@ class ViewManager:
             with st.expander("➕ Adicionar Nova Requisição"):
                 st.info("Crie uma nova Requisição de Compra a partir de uma demanda que ainda não foi atendida.")
                 st.subheader("Passo 1: Selecione a Demanda")
-                df_demandas_abertas = self.db.get_docs("demandas", [("status_demanda", "==", "Aberta")])
+
+                # OTIMIZAÇÃO: Carrega todas demandas do CACHE e filtra 'Aberta' na memória
+                all_demandas = get_cached_docs(self.db, "demandas")
+                if not all_demandas.empty:
+                    df_demandas_abertas = all_demandas[all_demandas['status_demanda'] == "Aberta"]
+                else:
+                    df_demandas_abertas = pd.DataFrame()
+
                 demanda_options = {"Selecione uma Demanda": None,
                                    **{f"ID: ...{r['id'][-6:]} - {r['descricao_necessidade'][:40]}...": r['id'] for _, r
                                       in df_demandas_abertas.iterrows()}}
                 selected_demanda_key = st.selectbox("Vincular à Demanda", list(demanda_options.keys()),
                                                     label_visibility="collapsed")
                 selected_demanda_id = demanda_options.get(selected_demanda_key)
+
                 if selected_demanda_id:
                     details = df_demandas_abertas[df_demandas_abertas['id'] == selected_demanda_id].iloc[0]
                     with st.container(border=True):
                         st.markdown("##### Detalhes da Demanda Selecionada")
                         st.text_area("Descrição da Necessidade", value=details['descricao_necessidade'], height=150,
                                      disabled=True)
-                        c1, c2, c3 = st.columns(3);
-                        c1.markdown(f"**Tipo:**\n\n`{details.get('tipo', 'N/A')}`");
-                        c2.markdown(f"**Categoria:**\n\n`{details['categoria']}`");
+                        c1, c2, c3 = st.columns(3)
+                        c1.markdown(f"**Tipo:**\n\n`{details.get('tipo', 'N/A')}`")
+                        c2.markdown(f"**Categoria:**\n\n`{details['categoria']}`")
                         c3.markdown(f"**Solicitante:**\n\n`{details['solicitante_demanda']}`")
                         anexo_info = details.get('anexo')
                         if anexo_info and isinstance(anexo_info, dict) and 'b64_data' in anexo_info:
@@ -1172,6 +1233,7 @@ class ViewManager:
                                                    mime=anexo_info.get('content_type', 'application/octet-stream'))
                             except Exception as e:
                                 st.error(f"Não foi possível carregar o anexo: {e}")
+
                     st.subheader("Passo 2: Detalhes da Requisição")
                     with st.form("requisicao_form_details", clear_on_submit=True):
                         valor_str, numero_rc = st.text_input("Valor (R$)", placeholder="Ex: 1.234,56"), st.text_input(
@@ -1179,11 +1241,13 @@ class ViewManager:
                         if st.form_submit_button("Registrar Requisição", type="primary"):
                             try:
                                 valor = parse_brazilian_float(valor_str)
-                                if valor <= 0: st.error("O valor deve ser maior que zero."); return
+                                if valor <= 0:
+                                    st.error("O valor deve ser maior que zero.")
+                                    return
                                 requisicao = Requisicao(solicitante=st.session_state.username,
                                                         demanda_id=selected_demanda_id, valor=valor,
                                                         numero_rc=numero_rc or None)
-                                req_data = requisicao.model_dump();
+                                req_data = requisicao.model_dump()
                                 req_data['historico'] = [
                                     f"Criado por {st.session_state.username} em {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
                                 update_demanda_data = {"status_demanda": "Em Atendimento", "updated_at": datetime.now()}
@@ -1191,16 +1255,20 @@ class ViewManager:
                                                                      selected_demanda_id, update_demanda_data):
                                     self.db.log_action("Requisicao Created", st.session_state.username,
                                                        {"demanda_id": selected_demanda_id, "valor": valor})
-                                    st.toast("✅ Requisição registrada!", icon="✅");
-                                    time.sleep(1);
+                                    st.toast("✅ Requisição registrada!", icon="✅")
+                                    time.sleep(1)
                                     st.rerun()
                             except ValueError:
                                 return
                             except Exception as e:
                                 st.error(f"Erro ao registrar: {e}")
+
         st.header("Requisições Registradas")
-        df_rc, df_demandas, df_users = self.db.get_docs("requisicoes"), self.db.get_docs("demandas"), self.db.get_docs(
-            "users")
+        # OTIMIZAÇÃO: Usa cache
+        df_rc = get_cached_docs(self.db, "requisicoes")
+        df_demandas = get_cached_docs(self.db, "demandas")
+        df_users = get_cached_docs(self.db, "users")
+
         filtered_rcs = self.render_advanced_filters(df_rc, "requisicoes")
         if not filtered_rcs.empty:
             df_for_export = self._prepare_df_for_export_rc(filtered_rcs, df_demandas)
@@ -1208,6 +1276,7 @@ class ViewManager:
                                file_name="requisicoes_exportadas.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                key="export_requisicoes")
+
         st.divider()
         self._render_paginated_rows(filtered_rcs, self.render_data_row, "rcs", collection="requisicoes",
                                     all_demandas=df_demandas, all_users=df_users)
@@ -1228,20 +1297,28 @@ class ViewManager:
 
     def render_pedidos(self):
         st.header("🚚 Pedidos de Compra")
-        all_pedidos, all_rcs, all_demandas, all_users = self.db.get_docs("pedidos"), self.db.get_docs(
-            "requisicoes"), self.db.get_docs("demandas"), self.db.get_docs("users")
+        # OTIMIZAÇÃO: Usa cache para todas as tabelas
+        all_pedidos = get_cached_docs(self.db, "pedidos")
+        all_rcs = get_cached_docs(self.db, "requisicoes")
+        all_demandas = get_cached_docs(self.db, "demandas")
+        all_users = get_cached_docs(self.db, "users")
+
         tabs = st.tabs(["⏳ Em Andamento", "✅ Entregues", "❌ Cancelados"])
         status_map = [['Em Processamento', 'Em Transporte'], ['Entregue'], ['Cancelado']]
+
         for tab, statuses in zip(tabs, status_map):
             with tab:
+                # Filtra na memória
                 df_tab_filtered = all_pedidos[
                     all_pedidos['status'].isin(statuses)] if not all_pedidos.empty else pd.DataFrame()
                 final_filtered_pedidos = self.render_advanced_filters(df_tab_filtered, f"pedidos_{statuses[0]}")
+
                 if not final_filtered_pedidos.empty:
                     df_for_export = self._prepare_df_for_export_pedidos(final_filtered_pedidos, all_rcs, all_demandas)
                     st.download_button("📥 Exportar para Excel", to_excel(df_for_export, f"Pedidos {statuses[0]}"),
                                        f'pedidos_{statuses[0].lower().replace(" ", "_")}.xlsx',
                                        key=f'btn_export_{statuses[0]}')
+
                 st.divider()
                 self._render_paginated_rows(final_filtered_pedidos, self.render_data_row, f"pedidos_{statuses[0]}",
                                             collection="pedidos", all_rcs=all_rcs, all_demandas=all_demandas,
@@ -1249,6 +1326,16 @@ class ViewManager:
 
     def render_controle_cadastro(self):
         st.header("📜 Controle de Cadastro de Itens")
+
+        # --- PARTE NOVA (OTIMIZADA) ---
+
+        # 1. Carrega TODAS as solicitações do cache de uma vez só
+        # Em vez de ir ao banco duas vezes, pegamos tudo aqui.
+        df_all_cadastros = get_cached_docs(self.db, "solicitacoes_cadastro")
+
+        # 2. Carrega lista de usuários do cache (para passar pros métodos internos depois)
+        all_users = get_cached_docs(self.db, "users")
+
         with st.expander("➕ Solicitar Novo Cadastro de Item"):
             with st.form("solicitacao_cadastro_form", clear_on_submit=True):
                 descricao = st.text_area("Descrição do item a ser cadastrado")
@@ -1260,31 +1347,47 @@ class ViewManager:
                                                                descricao=descricao)
                         if self.db.add_doc("solicitacoes_cadastro", nova_solicitacao.model_dump()):
                             st.success("Solicitação de cadastro enviada!")
-                            time.sleep(1);
+                            # Como salvamos algo novo, precisamos limpar o cache para ele aparecer na lista
+                            clear_cache()
+                            time.sleep(1)
                             st.rerun()
+
         st.divider()
         tab_cadastrando, tab_concluido = st.tabs(["⏳ Cadastrando", "✅ Concluído"])
-        all_users = self.db.get_docs("users")
+
+        # --- FILTRAGEM NA MEMÓRIA ---
+
         with tab_cadastrando:
-            df_cadastrando = self.db.get_docs("solicitacoes_cadastro", [("status", "==", "Cadastrando")])
+            # Aqui filtramos usando Pandas (memória) em vez de chamar self.db.get_docs
+            if not df_all_cadastros.empty:
+                # Pega apenas as linhas onde status == 'Cadastrando'
+                df_cadastrando = df_all_cadastros[df_all_cadastros['status'] == "Cadastrando"]
+            else:
+                df_cadastrando = pd.DataFrame()
+
             if not df_cadastrando.empty:
                 st.download_button("📥 Exportar para Excel", to_excel(df_cadastrando, "Cadastros Pendentes"),
                                    'cadastros_pendentes.xlsx')
-            if df_cadastrando.empty:
-                st.info("Nenhuma solicitação de cadastro pendente.")
-            else:
                 for _, item in df_cadastrando.iterrows():
                     self._render_solicitacao_cadastro_row(item, all_users)
+            else:
+                st.info("Nenhuma solicitação de cadastro pendente.")
+
         with tab_concluido:
-            df_concluido = self.db.get_docs("solicitacoes_cadastro", [("status", "==", "Concluído")])
+            # Aqui filtramos novamente a mesma tabela carregada no início
+            if not df_all_cadastros.empty:
+                # Pega apenas as linhas onde status == 'Concluído'
+                df_concluido = df_all_cadastros[df_all_cadastros['status'] == "Concluído"]
+            else:
+                df_concluido = pd.DataFrame()
+
             if not df_concluido.empty:
                 st.download_button("📥 Exportar para Excel", to_excel(df_concluido, "Cadastros Concluídos"),
                                    'cadastros_concluidos.xlsx')
-            if df_concluido.empty:
-                st.info("Nenhum item concluído.")
-            else:
                 for _, item in df_concluido.iterrows():
                     self._render_solicitacao_cadastro_row(item, all_users)
+            else:
+                st.info("Nenhum item concluído.")
 
     def _render_solicitacao_cadastro_row(self, item_row, all_users):
         """Renderiza uma única linha de solicitação de cadastro com ações."""
@@ -1584,86 +1687,6 @@ class ViewManager:
                         pass
         if st.button("Cancelar"): st.session_state.generate_pedido_from_rc = None; st.rerun()
 
-    def render_edit_modal(self):
-        edit_info = st.session_state.edit_id
-        st.title(f"✏️ Editando {edit_info['collection'][:-1].capitalize()}")
-        with st.form(key=f"edit_form_{edit_info['id']}"):
-            st.subheader(f"ID: ...{edit_info['id'][-6:]}")
-            data, new_data, valor_str = edit_info['data'], {}, None
-            if edit_info['collection'] == 'demandas':
-                new_data['descricao_necessidade'] = st.text_area("Descrição", data.get('descricao_necessidade', ''))
-                tipos, categorias_fixas = ["Material", "Serviço"], ["Facilities/Eletromecânica", "Manutenção de rede",
-                                                                    "Tratamento", "Tratamento (Laboratório)"]
-                new_data['tipo'] = st.selectbox("Tipo", tipos,
-                                                index=tipos.index(data.get('tipo')) if data.get('tipo') in tipos else 0)
-                new_data['categoria'] = st.selectbox("Categoria", categorias_fixas,
-                                                     index=categorias_fixas.index(data.get('categoria')) if data.get(
-                                                         'categoria') in categorias_fixas else 0)
-                opts = ["Aberta", "Em Atendimento", "Fechada", "Cancelada"];
-                new_data['status_demanda'] = st.selectbox("Status", opts, index=opts.index(data.get('status_demanda')))
-                all_users, user_list = self.db.get_docs("users"), ["Ninguém"]
-                if not all_users.empty: user_list += sorted(all_users['username'].unique().tolist())
-                current_assigned = data.get('assigned_to');
-                assigned_index = user_list.index(current_assigned) if current_assigned in user_list else 0
-                new_data['assigned_to'] = st.selectbox("Atribuir para:", user_list, index=assigned_index)
-                if new_data['assigned_to'] == "Ninguém": new_data['assigned_to'] = None
-            elif edit_info['collection'] == 'requisicoes':
-                new_data['numero_rc'] = st.text_input("Número da RC", data.get('numero_rc', ''))
-                valor_str = st.text_input("Valor (R$)",
-                                          value=f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.'))
-                new_data['status'] = st.selectbox("Status", ["Aberto", "Pedido Gerado", "Cancelado"],
-                                                  index=["Aberto", "Pedido Gerado", "Cancelado"].index(
-                                                      data.get('status')))
-            elif edit_info['collection'] == 'pedidos':
-                new_data['numero_pedido'] = st.text_input("Número do Pedido", data.get('numero_pedido', ''))
-                valor_str = st.text_input("Valor (R$)",
-                                          value=f"{data.get('valor', 0.0):_.2f}".replace('.', ',').replace('_', '.'))
-                opts = ["Em Processamento", "Em Transporte", "Entregue", "Cancelado"];
-                new_data['status'] = st.selectbox("Status", opts, index=opts.index(data.get('status')))
-                entrega_val = pd.to_datetime(data.get('data_entrega')).date() if pd.notna(
-                    data.get('data_entrega')) else None
-                data_entrega_input = st.date_input("Data de Entrega", value=entrega_val)
-                new_data['data_entrega'] = datetime.combine(data_entrega_input,
-                                                            datetime.min.time()) if data_entrega_input else None
-                new_data['observacao'] = st.text_area("Observação", data.get('observacao', ''))
-            elif edit_info['collection'] == 'solicitacoes_cadastro':
-                new_data['descricao'] = st.text_area("Descrição do item a ser cadastrado", data.get('descricao', ''))
-            c1, c2 = st.columns(2)
-            if c1.form_submit_button("Salvar", type="primary"):
-                try:
-                    if valor_str is not None: new_data['valor'] = parse_brazilian_float(valor_str)
-
-                    # --- LÓGICA DE NOTIFICAÇÃO ADICIONADA ---
-                    if edit_info['collection'] == 'demandas':
-                        old_assigned = data.get('assigned_to')
-                        new_assigned = new_data.get('assigned_to')
-
-                        # Notifica apenas se o campo 'assigned_to' mudou e não está vazio
-                        if new_assigned and new_assigned != old_assigned:
-                            self._create_assignment_notification(
-                                assigned_user=new_assigned,
-                                author=st.session_state.username,
-                                collection=edit_info['collection'],
-                                doc_id=edit_info['id'],
-                                description=new_data.get('descricao_necessidade', 'Item Editado')
-                            )
-                    # --- FIM DA LÓGICA ---
-
-                    if self.db.update_doc(edit_info['collection'], edit_info['id'], new_data,
-                                          st.session_state.username):
-                        self.db.log_action(f"{edit_info['collection'][:-1].capitalize()} Updated",
-                                           st.session_state.username, {"doc_id": edit_info['id'],
-                                                                       "changes": {k: str(v) for k, v in
-                                                                                   new_data.items() if
-                                                                                   k != 'historico'}})
-                        st.toast("Atualizado!", icon="💾");
-                        st.session_state.edit_id = None;
-                        time.sleep(1);
-                        st.rerun()
-                except ValueError:
-                    pass
-            if c2.form_submit_button("Cancelar"): st.session_state.edit_id = None; st.rerun()
-
     def _convert_firestore_types(self, obj):
         if hasattr(obj, 'isoformat'): return obj.isoformat()
         if isinstance(obj, bytes): return base64.b64encode(obj).decode('utf-8')
@@ -1676,41 +1699,146 @@ class ViewManager:
             backup_data = {}
             collections_to_backup = ["users", "demandas", "requisicoes", "pedidos", "audit_logs", "notifications"]
             for col in collections_to_backup:
-                docs_df = self.db.get_docs(col)
-                if docs_df.empty: backup_data[col] = []; continue
+                # OTIMIZAÇÃO: Usa get_cached_docs para gerar backup (mais rápido e econômico)
+                docs_df = get_cached_docs(self.db, col)
+                if docs_df.empty:
+                    backup_data[col] = []
+                    continue
+
+                # Converte DataFrame para lista de dicionários
                 records = docs_df.to_dict(orient='records')
+                # Processa tipos complexos (datas, bytes)
                 processed_records = [self._convert_firestore_types(rec) for rec in records]
                 backup_data[col] = processed_records
+
             return json.dumps(backup_data, ensure_ascii=False, indent=4).encode('utf-8')
         except Exception as e:
             logger.error(f"Falha ao gerar dados de backup: {e}", exc_info=True)
-            st.error(f"Erro ao gerar backup: {e}");
+            st.error(f"Erro ao gerar backup: {e}")
             return b""
 
     def render_logs_tab(self):
         st.header("🛡️ Registros de Atividades do Sistema")
-        logs_df = self.db.get_docs("audit_logs")
-        if logs_df.empty: st.info("Nenhum registro de atividade encontrado."); return
+
+        # OTIMIZAÇÃO CRÍTICA: Carrega logs do cache
+        logs_df = get_cached_docs(self.db, "audit_logs")
+
+        if logs_df.empty:
+            st.info("Nenhum registro de atividade encontrado.")
+            return
+
         col1, col2 = st.columns(2)
         with col1:
-            users = ["Todos"] + sorted(logs_df['username'].unique().tolist())
+            # Verifica se a coluna existe antes de usar e converte para string para evitar erros de tipo
+            if 'username' in logs_df.columns:
+                unique_users = sorted(logs_df['username'].astype(str).unique().tolist())
+            else:
+                unique_users = []
+            users = ["Todos"] + unique_users
             selected_user = st.selectbox("Filtrar por Usuário", users)
-        with col2:
-            actions = ["Todos"] + sorted(logs_df['action'].unique().tolist())
-            selected_action = st.selectbox("Filtrar por Ação", actions)
-        filtered_df = logs_df.copy()
-        if selected_user != "Todos": filtered_df = filtered_df[filtered_df['username'] == selected_user]
-        if selected_action != "Todos": filtered_df = filtered_df[filtered_df['action'] == selected_action]
 
-        df_para_exibir = filtered_df[['timestamp', 'username', 'action', 'details']].copy()
+        with col2:
+            if 'action' in logs_df.columns:
+                unique_actions = sorted(logs_df['action'].astype(str).unique().tolist())
+            else:
+                unique_actions = []
+            actions = ["Todos"] + unique_actions
+            selected_action = st.selectbox("Filtrar por Ação", actions)
+
+        filtered_df = logs_df.copy()
+        if selected_user != "Todos":
+            filtered_df = filtered_df[filtered_df['username'] == selected_user]
+        if selected_action != "Todos":
+            filtered_df = filtered_df[filtered_df['action'] == selected_action]
+
+        # Seleciona apenas colunas existentes para evitar KeyError
+        cols_to_show = ['timestamp', 'username', 'action', 'details']
+        available_cols = [c for c in cols_to_show if c in filtered_df.columns]
+
+        df_para_exibir = filtered_df[available_cols].copy()
+
         if 'details' in df_para_exibir.columns:
             df_para_exibir['details'] = df_para_exibir['details'].astype(str)
 
-        st.dataframe(df_para_exibir, use_container_width=True,
-                     column_config={
-                         "timestamp": st.column_config.DatetimeColumn("Data e Hora", format="DD/MM/YYYY - HH:mm:ss"),
-                         "username": "Usuário", "action": "Ação", "details": "Detalhes"}, hide_index=True)
+        st.dataframe(
+            df_para_exibir,
+            use_container_width=True,
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Data e Hora", format="DD/MM/YYYY - HH:mm:ss"),
+                "username": "Usuário",
+                "action": "Ação",
+                "details": "Detalhes"
+            },
+            hide_index=True
+        )
 
+    @st.dialog("🔔 Notificações")
+    def render_notifications_modal(self):
+        if not st.session_state.notifications_list:
+            st.info("Nenhuma notificação encontrada.")
+            if st.button("Fechar"):
+                st.session_state.show_notifications = False
+                st.rerun()
+            return
+
+        if st.button("Marcar todas como lidas"):
+            batch = self.db.db.batch()  # Usa batch para economizar writes
+            ids_to_ignore = []
+
+            for notif in st.session_state.notifications_list:
+                # Se for notificação normal (tem ID do banco)
+                if 'id' in notif and not notif['id'].startswith('admin_approval'):
+                    doc_ref = self.db.db.collection("notifications").document(notif['id'])
+                    batch.update(doc_ref, {"read": True})
+                    ids_to_ignore.append(notif['id'])
+
+            batch.commit()
+
+            # Atualiza LOCALMENTE sem limpar cache global
+            st.session_state.ignored_notifications.update(ids_to_ignore)
+            st.session_state.show_notifications = False
+            st.rerun()
+
+        st.divider()
+
+        for i, notif in enumerate(st.session_state.notifications_list):
+            with st.container(border=True):
+                col_txt, col_btn = st.columns([0.85, 0.15])
+
+                with col_txt:
+                    icone = "👤" if notif.get('type') == 'admin_approval' else "💬"
+                    st.markdown(f"**{icone} {notif.get('author', 'Sistema')}**")
+                    st.write(notif.get('message', ''))
+                    if 'timestamp' in notif:
+                        ts = notif['timestamp']
+                        if hasattr(ts, 'strftime'):
+                            st.caption(f"Em: {ts.strftime('%d/%m/%Y %H:%M')}")
+
+                with col_btn:
+                    # AÇÃO: APROVAR USUÁRIO
+                    if notif.get('type') == 'admin_approval':
+                        user_id = notif['id'].replace("admin_approval_", "")
+                        if st.button("✅", key=f"ok_{i}"):
+                            # Aqui precisamos usar o update normal pois altera tabela de usuários (importante refletir globalmente)
+                            # Mas para não travar, podemos fazer update direto e ignorar notificação
+                            self.db.db.collection("users").document(user_id).update({"status": "active"})
+                            self.db.log_action("User Approved", st.session_state.username, {"target": user_id})
+
+                            # Remove da vista imediatamente
+                            st.session_state.ignored_notifications.add(notif['id'])
+                            st.rerun()
+
+                    # AÇÃO: MARCAR COMO LIDA (Notificação normal)
+                    elif 'id' in notif:
+                        if st.button("✖️", key=f"del_{i}"):
+                            # 1. Update silencioso no Firebase (sem clear_cache)
+                            self.db.db.collection("notifications").document(notif['id']).update({"read": True})
+
+                            # 2. Update na memória local
+                            st.session_state.ignored_notifications.add(notif['id'])
+
+                            # 3. Rerun para atualizar a UI instantaneamente
+                            st.rerun()
 
 # -----------------------------------------------------------------------------
 # 4. PONTO DE ENTRADA DA APLICAÇÃO
@@ -1721,7 +1849,7 @@ if __name__ == "__main__":
         if "firebase_credentials" not in st.secrets:
             st.error("Credenciais do Firebase não encontradas! Verifique seu arquivo secrets.toml.");
             st.stop()
-        db_service = FirebaseService(dict(st.secrets["firebase_credentials"]))
+        db_service = get_db_service(dict(st.secrets["firebase_credentials"]))
         auth_service = AuthService(db_service)
         app = ViewManager(auth_service, db_service)
         app.run()
