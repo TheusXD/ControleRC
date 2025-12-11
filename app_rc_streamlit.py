@@ -1464,6 +1464,16 @@ class ViewManager:
     def render_sidebar(self):
         with st.sidebar:
             st.write(f"👤 **{st.session_state.username}** ({st.session_state.role})")
+            # --- BOTÃO DE ATUALIZAÇÃO MANUAL (NOVO) ---
+            # Use isso quando quiser baixar dados novos do Firebase
+            if st.button("🔄 Atualizar Dados (F5)", help="Baixa dados novos do servidor. Gasta leituras."):
+                # Limpa o cache nativo do Streamlit
+                st.cache_data.clear()
+                # Limpa as variáveis da memória local (Modo Econômico)
+                for key in list(st.session_state.keys()):
+                    if key.startswith("data_"):  # Limpa data_demandas, data_pedidos, etc.
+                        del st.session_state[key]
+                st.rerun()
             with st.expander("Meu Perfil", expanded=True):
                 with st.form("change_password_form", clear_on_submit=True):
                     st.subheader("Alterar Senha")
