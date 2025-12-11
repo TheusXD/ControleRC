@@ -40,8 +40,8 @@ def get_cached_users_list(_db_service):
     return ["Ninguém"]
 
 def clear_cache():
-    """Limpa a memória para mostrar dados novos após salvar."""
-    st.cache_data.clear()
+    """Modo Econômico: Não limpa o cache global para economizar leituras."""
+    pass  # <--- IMPORTANTE: Não faz nada!
 
 # Configurar o logging para monitorizar a aplicação
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -583,6 +583,122 @@ class ViewManager:
         self.auth, self.db = auth_service, db_service
         self._init_session_state()
 
+        # -------------------------------------------------------------------------
+        # MÉTODOS DO MODO ECONÔMICO (Gerenciamento de Estado Local)
+        # -------------------------------------------------------------------------
+
+    def get_data(self, collection: str) -> pd.DataFrame:
+        """
+        Substitui o get_cached_docs.
+        Pega dados do Session State (Rápido/Grátis) ou carrega do Cache na 1ª vez.
+        """
+        key = f"data_{collection}"
+
+        # Se não existe na memória RAM local, busca do Cache/Banco (só na 1ª vez)
+        if key not in st.session_state:
+            st.session_state[key] = get_cached_docs(self.db, collection)
+
+        return st.session_state[key]
+
+    def local_add(self, collection: str, new_data: dict):
+        """Adiciona um item à lista na memória sem gastar leitura."""
+        key = f"data_{collection}"
+        df = self.get_data(collection)
+
+        # Garante que as colunas de data estejam no formato certo
+        if 'created_at' in new_data:
+            if isinstance(new_data['created_at'], datetime):
+                new_data['created_at'] = pd.Timestamp(new_data['created_at'])
+
+        new_row = pd.DataFrame([new_data])
+
+        if df.empty:
+            st.session_state[key] = new_row
+        else:
+            st.session_state[key] = pd.concat([df, new_row], ignore_index=True)
+
+        # Reordena (mais novo primeiro)
+        if 'created_at' in st.session_state[key].columns:
+            st.session_state[key] = st.session_state[key].sort_values(by='created_at', ascending=False)
+
+    def local_update(self, collection: str, doc_id: str, updated_fields: dict):
+        """Atualiza um item na memória sem gastar leitura."""
+        key = f"data_{collection}"
+        df = self.get_data(collection)
+
+        if df.empty: return
+
+        idx = df[df['id'] == doc_id].index
+
+        if not idx.empty:
+            i = idx[0]
+            for field, value in updated_fields.items():
+                if isinstance(value, datetime):
+                    value = pd.Timestamp(value)
+                df.at[i, field] = value
+            st.session_state[key] = df
+
+    def local_delete(self, collection: str, doc_id: str):
+        """Remove um item da memória sem gastar leitura."""
+        key = f"data_{collection}"
+        df = self.get_data(collection)
+
+        if df.empty: return
+
+        st.session_state[key] = df[df['id'] != doc_id]
+
+        def local_add(self, collection: str, new_data: dict):
+            """Adiciona um item à lista na memória sem gastar leitura."""
+            key = f"data_{collection}"
+            df = self.get_data(collection)
+
+            # Garante que as colunas de data estejam no formato certo para não quebrar ordenação
+            if 'created_at' in new_data:
+                if isinstance(new_data['created_at'], datetime):
+                    new_data['created_at'] = pd.Timestamp(new_data['created_at'])
+
+            # Cria um DataFrame de 1 linha e junta com o atual
+            new_row = pd.DataFrame([new_data])
+
+            # Se o DF original estiver vazio, o concat pode reclamar de tipos, então tratamos:
+            if df.empty:
+                st.session_state[key] = new_row
+            else:
+                st.session_state[key] = pd.concat([df, new_row], ignore_index=True)
+
+            # Reordena (mais novo primeiro)
+            if 'created_at' in st.session_state[key].columns:
+                st.session_state[key] = st.session_state[key].sort_values(by='created_at', ascending=False)
+
+        def local_update(self, collection: str, doc_id: str, updated_fields: dict):
+            """Atualiza um item na memória sem gastar leitura."""
+            key = f"data_{collection}"
+            df = self.get_data(collection)
+
+            if df.empty: return
+
+            # Encontra o índice da linha que tem esse ID
+            idx = df[df['id'] == doc_id].index
+
+            if not idx.empty:
+                i = idx[0]
+                for field, value in updated_fields.items():
+                    # Converte datas se necessário
+                    if isinstance(value, datetime):
+                        value = pd.Timestamp(value)
+                    df.at[i, field] = value
+                st.session_state[key] = df
+
+        def local_delete(self, collection: str, doc_id: str):
+            """Remove um item da memória sem gastar leitura."""
+            key = f"data_{collection}"
+            df = self.get_data(collection)
+
+            if df.empty: return
+
+            # Filtra removendo o ID deletado (mantém apenas o que é diferente do ID)
+            st.session_state[key] = df[df['id'] != doc_id]
+
     def _init_session_state(self):
         defaults = {'logged_in': False, 'username': "", 'role': "", 'page': "Login", 'user_data': {},
                     'confirm_delete': {}, 'edit_id': None,
@@ -818,10 +934,11 @@ class ViewManager:
                     if update_data:
                         update_data['updated_at'] = datetime.now()
                         if self.db.update_doc(collection, doc_id, update_data, st.session_state.username):
-                            self.db.log_action("Item Edited", st.session_state.username,
-                                               {"id": doc_id, "col": collection})
-                            st.toast("✅ Salvo com sucesso!")
-                            time.sleep(1)
+                            # --- MODO ECONÔMICO ---
+                            self.local_update(collection, doc_id, update_data)
+                            # ----------------------
+
+                            self.db.log_action("Item Edited", ...)
                             st.session_state.edit_id = None
                             st.rerun()
 
@@ -1125,8 +1242,11 @@ class ViewManager:
                 c1, c2, _ = st.columns([1, 1, 8])
                 if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
                     self.db.delete_doc(collection, row['id'])
-                    self.db.log_action(f"{collection[:-1].capitalize()} Deleted", st.session_state.username,
-                                       {"doc_id": row['id'], "description": title})
+
+                    # --- MODO ECONÔMICO ---
+                    self.local_delete(collection, row['id'])
+                    # ----------------------
+                    self.db.log_action(...)
                     st.session_state.confirm_delete = {}
                     st.rerun()
                 if c2.button("Cancelar", key=f"canc_del_{key}"):
@@ -1585,7 +1705,7 @@ class ViewManager:
         st.header("📊 Dashboard de Métricas")
 
         # 1. Carrega TODOS os dados brutos do banco
-        df_demandas = get_cached_docs(self.db, "demandas")
+        df_demandas = self.get_data("demandas") # Usa a memória local
         df_rc = get_cached_docs(self.db, "requisicoes")
         df_pedidos = get_cached_docs(self.db, "pedidos")
 
@@ -1758,6 +1878,14 @@ class ViewManager:
 
                                 new_demanda_id = self.db.add_doc("demandas", demanda_data)
                                 if new_demanda_id:
+                                    # --- MODO ECONÔMICO: ATUALIZA MEMÓRIA ---
+                                    demanda_data['id'] = new_demanda_id
+                                    self.local_add("demandas", demanda_data)
+                                    # ----------------------------------------
+
+                                    self.db.log_action("Demanda Created", st.session_state.username, ...)
+                                    st.toast("✅ Demanda registrada!")
+                                    st.rerun()  # Agora o rerun vai pegar o dado da memória!
                                     self.db.log_action("Demanda Created", st.session_state.username,
                                                        {"doc_id": new_demanda_id, "description": descricao,
                                                         "assigned_to": assigned_to})
@@ -1778,7 +1906,7 @@ class ViewManager:
 
         st.header("Demandas Registradas")
         # OTIMIZAÇÃO: Usa get_cached_docs para tudo
-        df_demandas = get_cached_docs(self.db, "demandas")
+        df_demandas = self.get_data("demandas") # Usa a memória local
         df_rcs = get_cached_docs(self.db, "requisicoes")
         df_pedidos = get_cached_docs(self.db, "pedidos")
         df_users = get_cached_docs(self.db, "users")
@@ -1930,7 +2058,7 @@ class ViewManager:
         st.header("Requisições Registradas")
         # OTIMIZAÇÃO: Usa cache
         df_rc = get_cached_docs(self.db, "requisicoes")
-        df_demandas = get_cached_docs(self.db, "demandas")
+        df_demandas = self.get_data("demandas") # Usa a memória local
         df_users = get_cached_docs(self.db, "users")
 
         filtered_rcs = self.render_advanced_filters(df_rc, "requisicoes")
@@ -2402,7 +2530,7 @@ class ViewManager:
         st.header("📋 Quadro de Tarefas")
 
         # 1. Carrega dados
-        df_demandas = get_cached_docs(self.db, "demandas")
+        df_demandas = self.get_data("demandas") # Usa a memória local
         if df_demandas.empty:
             st.info("Nenhuma demanda para exibir.")
             return
