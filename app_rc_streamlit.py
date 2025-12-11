@@ -148,6 +148,33 @@ class SolicitacaoCadastro(BaseModel):
 # -----------------------------------------------------------------------------
 
 class FirebaseService:
+    def add_attachment(self, collection: str, doc_id: str, file_data: dict) -> bool:
+        """Adiciona um arquivo à lista de anexos do documento."""
+        try:
+            doc_ref = self.db.collection(collection).document(doc_id)
+            # Usa arrayUnion para adicionar sem apagar os existentes
+            doc_ref.update({
+                "attachments": firestore.ArrayUnion([file_data])
+            })
+            clear_cache()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao anexar arquivo: {e}")
+            return False
+
+    def remove_attachment(self, collection: str, doc_id: str, file_data: dict) -> bool:
+        """Remove um arquivo da lista."""
+        try:
+            doc_ref = self.db.collection(collection).document(doc_id)
+            doc_ref.update({
+                "attachments": firestore.ArrayRemove([file_data])
+            })
+            clear_cache()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao remover anexo: {e}")
+            return False
+
     def __init__(self, creds: Dict[str, Any]):
         if not firebase_admin._apps:
             cred_dict = creds
@@ -643,39 +670,676 @@ class ViewManager:
             username, email, password = st.text_input("Nome de Usuário"), st.text_input("E-mail"), st.text_input(
                 "Senha", type="password")
             is_gestor = st.checkbox("Sou um gestor (requer aprovação do admin)")
-            if st.form_submit_button("Registrar", type="primary"): self.auth.register_user(username, email, password,
-                                                                                           is_gestor)
+            if st.form_submit_button("Registrar", type="primary"): self.auth.register_user(username, email, password,is_gestor)
+
+    def render_edit_modal(self):
+        """
+        Modal completo de edição com:
+        - Aba 1: Formulários específicos por tipo (Demanda, RC, Pedido)
+        - Aba 2: Gestão de Anexos (Upload/Download) e Chat Completo (Editar/Excluir)
+        """
+        edit_info = st.session_state.edit_id
+        collection = edit_info['collection']
+        doc_id = edit_info['id']
+
+        # Tenta buscar dados frescos do banco
+        current_data = self.db.get_doc(collection, doc_id)
+
+        # Se falhar (documento deletado por outro), usa o cache ou avisa
+        if not current_data:
+            st.error("Documento não encontrado ou excluído.")
+            if st.button("Fechar"):
+                st.session_state.edit_id = None
+                st.rerun()
+            return
+
+        # --- CABEÇALHO DO MODAL ---
+        desc_titulo = current_data.get('descricao_necessidade') or current_data.get('descricao') or "Item"
+        st.markdown(f"### ✏️ Editando: {desc_titulo[:60]}...")
+
+        # Cria as abas
+        tab_dados, tab_extras = st.tabs(["📄 Dados Principais", "📎 Anexos e Comentários"])
+
+        # =====================================================================
+        # ABA 1: FORMULÁRIOS DE EDIÇÃO
+        # =====================================================================
+        with tab_dados:
+            with st.form("edit_form"):
+                update_data = {}
+
+                # --- FORMULÁRIO: DEMANDAS ---
+                if collection == "demandas":
+                    descricao = st.text_area("Descrição Completa", value=current_data.get('descricao_necessidade', ''),
+                                             height=150)
+
+                    c1, c2 = st.columns(2)
+                    cats = ["Facilities/Eletromecânica", "Manutenção de rede", "Tratamento", "Tratamento (Laboratório)"]
+                    current_cat = current_data.get('categoria', cats[0])
+                    # Proteção se a categoria salva não estiver na lista
+                    idx_cat = cats.index(current_cat) if current_cat in cats else 0
+                    categoria = c1.selectbox("Categoria", cats, index=idx_cat)
+
+                    prio_opts = ["Baixa", "Média", "Alta"]
+                    current_prio = current_data.get('prioridade', "Média")
+                    idx_prio = prio_opts.index(current_prio) if current_prio in prio_opts else 1
+                    prioridade = c2.selectbox("Prioridade", prio_opts, index=idx_prio)
+
+                    c3, c4 = st.columns(2)
+                    status_opts = ["Aberta", "Em Atendimento", "Pendente", "Cancelado", "Concluída"]
+                    current_status = current_data.get('status_demanda', "Aberta")
+                    idx_stat = status_opts.index(current_status) if current_status in status_opts else 0
+                    status = c3.selectbox("Status", status_opts, index=idx_stat)
+
+                    tipo_opts = ["Material", "Serviço"]
+                    current_tipo = current_data.get('tipo', "Material")
+                    idx_tipo = tipo_opts.index(current_tipo) if current_tipo in tipo_opts else 0
+                    tipo = c4.selectbox("Tipo", tipo_opts, index=idx_tipo)
+
+                    update_data = {
+                        "descricao_necessidade": descricao,
+                        "categoria": categoria,
+                        "prioridade": prioridade,
+                        "status_demanda": status,
+                        "tipo": tipo
+                    }
+
+                # --- FORMULÁRIO: REQUISIÇÕES ---
+                elif collection == "requisicoes":
+                    val_atual = current_data.get('valor', 0.0)
+                    val_str = f"{val_atual:.2f}".replace('.', ',')
+
+                    c1, c2 = st.columns(2)
+                    numero_rc = c1.text_input("Número RC", value=current_data.get('numero_rc', ''))
+                    valor_input = c2.text_input("Valor (R$)", value=val_str)
+
+                    status_opts = ["Aberto", "Pedido Gerado", "Cancelado"]
+                    current_status = current_data.get('status', "Aberto")
+                    idx_stat = status_opts.index(current_status) if current_status in status_opts else 0
+                    status = st.selectbox("Status", status_opts, index=idx_stat)
+
+                    try:
+                        val_float = parse_brazilian_float(valor_input)
+                        update_data = {"numero_rc": numero_rc, "valor": val_float, "status": status}
+                    except:
+                        st.error("Valor inválido")
+
+                # --- FORMULÁRIO: PEDIDOS ---
+                elif collection == "pedidos":
+                    val_atual = current_data.get('valor', 0.0)
+                    val_str = f"{val_atual:.2f}".replace('.', ',')
+
+                    c1, c2 = st.columns(2)
+                    numero_pedido = c1.text_input("Número Pedido", value=current_data.get('numero_pedido', ''))
+                    valor_input = c2.text_input("Valor (R$)", value=val_str)
+
+                    c3, c4 = st.columns(2)
+                    status_opts = ["Em Processamento", "Em Transporte", "Entregue", "Cancelado"]
+                    current_status = current_data.get('status', "Em Processamento")
+                    idx_stat = status_opts.index(current_status) if current_status in status_opts else 0
+                    status = c3.selectbox("Status", status_opts, index=idx_stat)
+
+                    # Data de Entrega
+                    data_entrega_atual = current_data.get('data_entrega')
+                    if isinstance(data_entrega_atual, str):
+                        try:
+                            data_entrega_atual = datetime.fromisoformat(data_entrega_atual)
+                        except:
+                            data_entrega_atual = None
+                    elif isinstance(data_entrega_atual, datetime):
+                        data_entrega_atual = data_entrega_atual.date()
+
+                    data_entrega = c4.date_input("Previsão de Entrega", value=data_entrega_atual)
+
+                    try:
+                        val_float = parse_brazilian_float(valor_input)
+                        update_data = {
+                            "numero_pedido": numero_pedido,
+                            "valor": val_float,
+                            "status": status,
+                            "data_entrega": datetime.combine(data_entrega,
+                                                             datetime.min.time()) if data_entrega else None
+                        }
+                    except:
+                        st.error("Valor inválido")
+
+                # --- FORMULÁRIO: CADASTROS ---
+                elif collection == "solicitacoes_cadastro":
+                    descricao = st.text_area("Descrição", value=current_data.get('descricao', ''))
+                    update_data = {"descricao": descricao}
+
+                else:
+                    st.info("Edição básica não configurada para esta coleção.")
+
+                st.divider()
+
+                # BOTÕES DE AÇÃO DO FORMULÁRIO
+                col_b1, col_b2 = st.columns([1, 1])
+                if col_b1.form_submit_button("💾 Salvar Alterações", type="primary"):
+                    if update_data:
+                        update_data['updated_at'] = datetime.now()
+                        if self.db.update_doc(collection, doc_id, update_data, st.session_state.username):
+                            self.db.log_action("Item Edited", st.session_state.username,
+                                               {"id": doc_id, "col": collection})
+                            st.toast("✅ Salvo com sucesso!")
+                            time.sleep(1)
+                            st.session_state.edit_id = None
+                            st.rerun()
+
+                if col_b2.form_submit_button("Cancelar"):
+                    st.session_state.edit_id = None
+                    st.rerun()
+
+        # =====================================================================
+        # ABA 2: ANEXOS E COMENTÁRIOS (ESTILO PLANNER)
+        # =====================================================================
+        with tab_extras:
+            col_files, col_chat = st.columns([1, 1])
+
+            # --- COLUNA DA ESQUERDA: ARQUIVOS ---
+            with col_files:
+                st.subheader("📂 Arquivos")
+
+                # Lista anexos (Array 'attachments' + legado 'anexo')
+                attachments = current_data.get('attachments', [])
+                old_anexo = current_data.get('anexo')
+
+                # Compatibilidade: Se existir anexo antigo e não estiver na lista nova, adiciona visualmente
+                display_attachments = attachments.copy()
+                if old_anexo and isinstance(old_anexo, dict):
+                    # Verifica duplicidade simples pelo nome
+                    if not any(a.get('file_name') == old_anexo.get('file_name') for a in attachments):
+                        display_attachments.insert(0, old_anexo)
+
+                if not display_attachments:
+                    st.caption("Nenhum arquivo anexado.")
+                else:
+                    for idx, file in enumerate(display_attachments):
+                        with st.container(border=True):
+                            c_icon, c_name, c_down, c_del = st.columns([0.15, 0.55, 0.15, 0.15])
+
+                            # Ícone
+                            f_name = file.get('file_name', 'Arquivo')
+                            ext = os.path.splitext(f_name)[1].lower()
+                            icon = "📄"
+                            if ext in ['.pdf']:
+                                icon = "📕"
+                            elif ext in ['.xls', '.xlsx', '.csv']:
+                                icon = "📊"
+                            elif ext in ['.doc', '.docx']:
+                                icon = "📝"
+                            elif ext in ['.jpg', '.png', '.jpeg']:
+                                icon = "🖼️"
+                            c_icon.write(icon)
+
+                            # Nome
+                            c_name.write(f"**{f_name[:20]}...**" if len(f_name) > 20 else f"**{f_name}**")
+
+                            # Download
+                            try:
+                                b64_data = file.get('b64_data')
+                                if b64_data:
+                                    file_bytes = base64.b64decode(b64_data)
+                                    c_down.download_button("⬇️", file_bytes, file_name=f_name, key=f"dl_{doc_id}_{idx}")
+                            except:
+                                c_down.error("Err")
+
+                            # Excluir (Chama método do Service)
+                            if c_del.button("🗑️", key=f"rm_{doc_id}_{idx}"):
+                                # Verifica se é anexo novo ou legado
+                                if file in attachments:
+                                    self.db.remove_attachment(collection, doc_id, file)
+                                elif file == old_anexo:
+                                    self.db.update_doc(collection, doc_id, {"anexo": firestore.DELETE_FIELD},
+                                                       st.session_state.username)
+                                st.rerun()
+
+                st.divider()
+                st.write("**Adicionar novo arquivo:**")
+                new_file = st.file_uploader("Upload", type=['pdf', 'docx', 'xlsx', 'jpg', 'png', 'txt'],
+                                            key=f"up_{doc_id}", label_visibility="collapsed")
+
+                if new_file:
+                    if st.button("Enviar Arquivo", key=f"btn_up_{doc_id}"):
+                        is_valid, msg = self._validate_uploaded_file(new_file)
+                        if is_valid:
+                            b64 = base64.b64encode(new_file.getvalue()).decode('utf-8')
+                            file_data = {
+                                "file_name": new_file.name,
+                                "content_type": new_file.type,
+                                "b64_data": b64,
+                                "uploaded_at": datetime.now().isoformat(),
+                                "uploaded_by": st.session_state.username
+                            }
+                            # Chama método helper do FirebaseService
+                            self.db.add_attachment(collection, doc_id, file_data)
+                            st.toast("Arquivo anexado!")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+            # --- COLUNA DA DIREITA: CHAT COMPLETO ---
+            with col_chat:
+                st.subheader("💬 Comentários")
+
+                # Scroll Container
+                msg_container = st.container(height=400, border=True)
+
+                using_sub = current_data.get('using_comment_subcollection', False)
+
+                # Busca comentários
+                if using_sub:
+                    comentarios = self.db.get_comments_from_subcollection(collection, doc_id)
+                else:
+                    comentarios = current_data.get('comentarios', [])
+                    if not isinstance(comentarios, list): comentarios = []
+
+                with msg_container:
+                    if not comentarios:
+                        st.info("Nenhum comentário.")
+
+                    # Ordena: Antigo -> Novo
+                    sorted_comments = sorted(comentarios, key=lambda x: x.get('timestamp', datetime.min) if isinstance(
+                        x.get('timestamp'), datetime) else datetime.min)
+
+                    for c in sorted_comments:
+                        c_id = c.get('id')
+                        is_me = c.get('username') == st.session_state.username
+                        can_edit = is_me or st.session_state.role == 'admin'
+                        avatar = "👤" if not is_me else "😎"
+
+                        ts = c.get('timestamp')
+                        if isinstance(ts, str): ts = datetime.fromisoformat(ts)
+                        time_str = ts.strftime('%d/%m %H:%M') if ts else ""
+
+                        with st.chat_message(c.get('username'), avatar=avatar):
+                            # Header
+                            h_col, act_col = st.columns([0.8, 0.2])
+                            h_col.markdown(
+                                f"**{c.get('username')}** <span style='font-size:0.7em; color:gray'>{time_str}</span>",
+                                unsafe_allow_html=True)
+
+                            # Botões (Editar/Excluir)
+                            if can_edit:
+                                with act_col:
+                                    b1, b2 = st.columns(2)
+                                    if b1.button("✏️", key=f"ed_{c_id}", help="Editar"):
+                                        st.session_state.editing_comment = c_id
+                                        st.rerun()
+                                    if b2.button("🗑️", key=f"dl_{c_id}", help="Excluir"):
+                                        if using_sub:
+                                            self.db.db.collection(collection).document(doc_id).collection(
+                                                'comments').document(c_id).delete()
+                                        else:
+                                            new_list = [x for x in comentarios if x.get('id') != c_id]
+                                            self.db.update_doc(collection, doc_id, {"comentarios": new_list},
+                                                               st.session_state.username)
+                                        st.rerun()
+
+                            # Modo Edição vs Leitura
+                            if st.session_state.get('editing_comment') == c_id:
+                                edit_txt = st.text_area("Editar", value=c.get('text'), key=f"et_{c_id}")
+                                s_col, c_col = st.columns(2)
+                                if s_col.button("Salvar", key=f"sv_{c_id}"):
+                                    if using_sub:
+                                        self.db.db.collection(collection).document(doc_id).collection(
+                                            'comments').document(c_id).update(
+                                            {"text": edit_txt, "edited_at": datetime.now()})
+                                    else:
+                                        for item in comentarios:
+                                            if item['id'] == c_id:
+                                                item['text'] = edit_txt
+                                                item['edited_at'] = datetime.now()
+                                                break
+                                        self.db.update_doc(collection, doc_id, {"comentarios": comentarios},
+                                                           st.session_state.username)
+                                    del st.session_state.editing_comment
+                                    st.rerun()
+                                if c_col.button("Cancelar", key=f"cn_{c_id}"):
+                                    del st.session_state.editing_comment
+                                    st.rerun()
+                            else:
+                                # Leitura com quebra de linha corrigida
+                                clean_text = self._format_comment_text(c.get('text', ''),
+                                                                       get_cached_docs(self.db, "users"))
+                                st.markdown(clean_text)
+                                if 'edited_at' in c: st.caption("(editado)")
+
+                # Input Novo Comentário
+                new_msg = st.chat_input("Escreva um comentário...")
+                if new_msg:
+                    c_data = {
+                        "id": str(uuid.uuid4()),
+                        "username": st.session_state.username,
+                        "timestamp": datetime.now(),
+                        "text": new_msg
+                    }
+
+                    # Notificações @
+                    all_users = get_cached_docs(self.db, "users")
+                    valid_u = all_users['username'].tolist() if not all_users.empty else []
+                    for u in set(re.findall(r'@(\w+)', new_msg)):
+                        if u in valid_u and u != st.session_state.username:
+                            self._create_mention_notification(u, st.session_state.username, collection, doc_id)
+
+                    # Salvar
+                    if using_sub or len(comentarios) >= 20:
+                        if not using_sub:
+                            self.db.migrate_comments_to_subcollection(collection, doc_id)
+                        self.db.add_comment_to_subcollection(collection, doc_id, c_data)
+                    else:
+                        self.db.update_doc(collection, doc_id, {"comentarios": comentarios + [c_data]},
+                                           st.session_state.username)
+                    st.rerun()
+
+    def render_data_row(self, row: pd.Series, collection: str, **kwargs):
+        """Renderiza uma linha de dados (Card) nas listas de Demandas, RCs e Pedidos."""
+        key, role = f"{collection}_{row['id']}", st.session_state.role
+
+        with st.container(border=True):
+            # 1. Cabeçalho do Card (Varia conforme o tipo)
+            if collection == 'demandas':
+                assigned_str = f" | **Atribuído a:** `{row.get('assigned_to')}`" if row.get('assigned_to') else ""
+                title = f"Demanda: {row.get('descricao_necessidade', '')} (Tipo: {row.get('tipo', 'N/A')} | Cat: {row.get('categoria', 'N/A')})"
+                st.markdown(
+                    f"**{title}**\n\n**Status:** `{row.get('status_demanda', 'N/A')}` | **Criado por:** `{row.get('solicitante_demanda', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`{assigned_str}")
+
+            elif collection == 'requisicoes':
+                title = f"RC: {row.get('numero_rc', 'S/N')} | Valor: {format_brazilian_currency(row.get('valor', 0))}"
+                st.markdown(
+                    f"**{title}**\n\n**Status:** `{row.get('status', 'N/A')}` | **Criado por:** `{row.get('solicitante', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
+
+            else:  # Pedidos
+                title = f"Pedido: {row.get('numero_pedido', 'S/N')} | Valor: {format_brazilian_currency(row.get('valor', 0))}"
+                st.markdown(
+                    f"**{title}**\n\n**Status:** `{row.get('status', 'N/A')}` | **Criado por:** `{row.get('solicitante', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
+
+            # 2. Informações de Vínculo (Ex: Mostrar qual demanda gerou a RC)
+            if collection in ['requisicoes', 'pedidos']:
+                # Tenta achar o ID da demanda original
+                demanda_id = row.get('demanda_id')
+                if collection == 'pedidos':
+                    # Se for pedido, precisa achar a RC primeiro para pegar o demanda_id dela
+                    all_rcs = kwargs.get('all_rcs', pd.DataFrame())
+                    if not all_rcs.empty:
+                        rc_info = all_rcs[all_rcs['id'] == row.get('requisicao_id')]
+                        if not rc_info.empty:
+                            demanda_id = rc_info.iloc[0].get('demanda_id')
+
+                if demanda_id:
+                    demandas = kwargs.get('all_demandas', pd.DataFrame())
+                    if not demandas.empty:
+                        demanda_info = demandas[demandas['id'] == demanda_id]
+                        if not demanda_info.empty:
+                            with st.expander("Ver Descrição da Demanda Original"):
+                                st.info(demanda_info.iloc[0]['descricao_necessidade'])
+
+            # 3. Botões de Ação
+            cols = st.columns([1, 1, 1, 2, 5])
+
+            # Botão Editar
+            is_author = (row.get('solicitante_demanda') or row.get('solicitante')) == st.session_state.username
+            if is_author or self._has_permission("pode_excluir"):
+                cols[0].button("✏️", key=f"edit_{key}", help="Editar", on_click=self._set_edit_state,
+                               args=(collection, row.to_dict()))
+
+            # Botão Excluir
+            if self._has_permission("pode_excluir"):
+                cols[1].button("🗑️", key=f"del_{key}", help="Excluir", on_click=self._set_delete_state,
+                               args=(collection, row['id'], title))
+
+            # Botão Histórico
+            cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico", on_click=self._set_history_state,
+                           args=(collection, row.to_dict()))
+
+            # Botões de Fluxo (Ir para Pedido / Gerar Pedido)
+            if collection == 'demandas':
+                all_rcs = kwargs.get('all_rcs')
+                all_pedidos = kwargs.get('all_pedidos')
+
+                # Verifica se tem RC ligada
+                linked_rc = pd.DataFrame()
+                if all_rcs is not None and not all_rcs.empty:
+                    linked_rc = all_rcs[all_rcs['demanda_id'] == row['id']]
+
+                if not linked_rc.empty:
+                    rc_id = linked_rc.iloc[0]['id']
+                    # Verifica se tem Pedido ligado à RC
+                    linked_pedido = pd.DataFrame()
+                    if all_pedidos is not None and not all_pedidos.empty:
+                        linked_pedido = all_pedidos[all_pedidos['requisicao_id'] == rc_id]
+
+                    if not linked_pedido.empty:
+                        cols[3].button("🚚 Ver Pedido", key=f"goto_ped_{key}", on_click=self._set_focus_state,
+                                       args=('pedidos', linked_pedido.iloc[0]['id']))
+                    else:
+                        cols[3].button("🛒 Ver RC", key=f"goto_rc_{key}", on_click=self._set_focus_state,
+                                       args=('requisicoes', rc_id))
+
+            if collection == "requisicoes" and row.get('status') == "Aberto" and role in ['admin', 'user']:
+                cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary",
+                               on_click=self._set_generate_pedido_state, args=(row.to_dict(),))
+
+            # Lógica de Confirmação de Exclusão (Aparece se clicou na lixeira)
+            if st.session_state.confirm_delete.get('id') == row['id']:
+                st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
+                c1, c2, _ = st.columns([1, 1, 8])
+                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
+                    self.db.delete_doc(collection, row['id'])
+                    self.db.log_action(f"{collection[:-1].capitalize()} Deleted", st.session_state.username,
+                                       {"doc_id": row['id'], "description": title})
+                    st.session_state.confirm_delete = {}
+                    st.rerun()
+                if c2.button("Cancelar", key=f"canc_del_{key}"):
+                    st.session_state.confirm_delete = {}
+                    st.rerun()
+            # 4. Seção de Comentários
+            with st.expander("💬 Comentários"):
+                self._render_comments_section(row, collection, **kwargs)
+
+    def _render_comments_section(self, row, collection, **kwargs):
+        """
+        Renderiza a seção de comentários com layout simplificado para garantir
+        que os botões apareçam mesmo dentro de expanders.
+        """
+        doc_id = row['id']
+        using_sub = row.get('using_comment_subcollection', False)
+
+        # 1. CARREGA COMENTÁRIOS
+        if using_sub:
+            comentarios = self.db.get_comments_from_subcollection(collection, doc_id, limit=MAX_COMMENTS_DISPLAY)
+        else:
+            comentarios = row.get('comentarios', [])
+            if not isinstance(comentarios, list): comentarios = []
+
+            # Migração automática
+            if len(comentarios) >= MAX_COMMENTS_IN_DOCUMENT:
+                with st.spinner("Otimizando comentários..."):
+                    if self.db.migrate_comments_to_subcollection(collection, doc_id):
+                        st.rerun()
+
+        # 2. EXIBE A LISTA
+        if not comentarios:
+            st.caption("Nenhum comentário ainda.")
+        else:
+            # Ordena: Antigo -> Novo
+            sorted_comments = sorted(comentarios, key=lambda x: x.get('timestamp', datetime.min) if isinstance(x.get('timestamp'), datetime) else datetime.min)
+
+            for c in sorted_comments:
+                c_id = c.get('id')
+                # Verifica permissão
+                is_me = c.get('username') == st.session_state.username
+                can_edit = is_me or st.session_state.role == 'admin'
+
+                avatar = "👤" if not is_me else "😎"
+
+                # Formata data
+                ts = c.get('timestamp')
+                if isinstance(ts, str): ts = datetime.fromisoformat(ts)
+                time_str = ts.strftime('%d/%m %H:%M') if ts else ""
+
+                with st.chat_message(c.get('username'), avatar=avatar):
+
+                    # --- LAYOUT ROBUSTO (SEM COLUNAS ANINHADAS) ---
+                    # Divide a linha do cabeçalho em 3: [Texto] [Editar] [Excluir]
+                    if can_edit:
+                        # Se pode editar, reserva espaço para os botões
+                        c_head, c_edit, c_del = st.columns([0.8, 0.1, 0.1])
+                    else:
+                        # Se não pode editar, o texto ocupa tudo
+                        c_head = st.columns([1])[0]
+                        c_edit, c_del = None, None
+
+                    # Renderiza Nome e Data
+                    with c_head:
+                        st.markdown(f"**{c.get('username')}** <span style='font-size:0.75em; color:gray'>({time_str})</span>", unsafe_allow_html=True)
+
+                    # Renderiza Botões (direto na coluna principal, sem criar novas colunas dentro)
+                    if can_edit:
+                        with c_edit:
+                            if st.button("✏️", key=f"ed_{c_id}_{doc_id}", help="Editar"):
+                                st.session_state.editing_comment = c_id
+                                st.rerun()
+                        with c_del:
+                            if st.button("🗑️", key=f"dl_{c_id}_{doc_id}", help="Excluir"):
+                                if using_sub:
+                                    self.db.db.collection(collection).document(doc_id).collection('comments').document(c_id).delete()
+                                else:
+                                    new_list = [x for x in comentarios if x.get('id') != c_id]
+                                    self.db.update_doc(collection, doc_id, {"comentarios": new_list}, st.session_state.username)
+                                st.rerun()
+
+                    # --- CONTEÚDO (Visualização ou Edição) ---
+                    if st.session_state.get('editing_comment') == c_id:
+                        # MODO EDIÇÃO
+                        edit_txt = st.text_area("Editar:", value=c.get('text'), key=f"txt_{c_id}_{doc_id}")
+                        col_s, col_c = st.columns([1, 1])
+
+                        if col_s.button("✅ Salvar", key=f"sav_{c_id}_{doc_id}"):
+                            if using_sub:
+                                self.db.db.collection(collection).document(doc_id).collection('comments').document(c_id).update({
+                                    "text": edit_txt, "edited_at": datetime.now()
+                                })
+                            else:
+                                for item in comentarios:
+                                    if item.get('id') == c_id:
+                                        item['text'] = edit_txt
+                                        item['edited_at'] = datetime.now()
+                                        break
+                                self.db.update_doc(collection, doc_id, {"comentarios": comentarios}, st.session_state.username)
+
+                            del st.session_state.editing_comment
+                            st.rerun()
+
+                        if col_c.button("Cancelar", key=f"can_{c_id}_{doc_id}"):
+                            del st.session_state.editing_comment
+                            st.rerun()
+                    else:
+                        # MODO LEITURA (Usando sua função de formatação)
+                        safe_txt = self._format_comment_text(c.get('text', ''), kwargs.get('all_users', pd.DataFrame()))
+                        st.markdown(safe_txt)
+                        if 'edited_at' in c:
+                            st.caption("(editado)")
+
+        # 3. CAMPO PARA NOVO COMENTÁRIO
+        new_comment = st.text_area("Adicionar comentário", key=f"add_c_{doc_id}", height=68, label_visibility="collapsed", placeholder="Escreva um comentário...")
+        if st.button("Enviar", key=f"snd_c_{doc_id}"):
+            if new_comment:
+                c_data = {
+                    "id": str(uuid.uuid4()),
+                    "username": st.session_state.username,
+                    "timestamp": datetime.now(),
+                    "text": new_comment
+                }
+
+                # Notificações
+                all_users_df = kwargs.get('all_users', pd.DataFrame())
+                valid_users = all_users_df['username'].tolist() if not all_users_df.empty else []
+                for u in set(re.findall(r'@(\w+)', new_comment)):
+                    if u in valid_users and u != st.session_state.username:
+                        self._create_mention_notification(u, st.session_state.username, collection, doc_id)
+
+                # Salvar
+                if using_sub or len(comentarios) >= 20:
+                    if not using_sub:
+                        self.db.migrate_comments_to_subcollection(collection, doc_id)
+                        using_sub = True
+                    self.db.add_comment_to_subcollection(collection, doc_id, c_data)
+                else:
+                    self.db.update_doc(collection, doc_id, {"comentarios": comentarios + [c_data]}, st.session_state.username)
+
+                st.rerun()
 
     def render_main_app(self):
         self.render_sidebar()
+
+        # Se estiver em modo de edição (modal de tela cheia), mostra o editor
         if st.session_state.edit_id:
             self.render_edit_modal()
+        # Se estiver focado em um item específico (visualização detalhada), mostra o foco
         elif st.session_state.focus_item:
             self.render_focused_view()
         else:
-            col1, col2 = st.columns([0.8, 0.2]);
-            col1.title("🚀 Sistema de Controle de Compras");
+            # Cabeçalho Principal da Aplicação
+            col1, col2 = st.columns([0.8, 0.2])
+            col1.title("🚀 Sistema de Controle de Compras")
             with col2:
                 self.render_notification_bell()
-            tabs = ["📊 Dashboard", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos", "📜 Controle de Cadastros"]
-            if st.session_state.role == 'admin': tabs.append("🛡️ Registros de Atividades")
+
+            # --- DEFINIÇÃO DAS ABAS ---
+            # Aqui adicionamos "📋 Quadro" como a segunda aba
+            tabs = ["📊 Dashboard", "📋 Quadro", "📝 Demandas", "🛒 Requisições", "🚚 Pedidos", "📜 Controle de Cadastros"]
+
+            # Aba extra visível apenas para Admin
+            if st.session_state.role == 'admin':
+                tabs.append("🛡️ Registros de Atividades")
+
+            # Cria os componentes visuais das abas
             selected_tabs = st.tabs(tabs)
+
+            # --- CONTEÚDO DAS ABAS ---
+
+            # 1. Dashboard
             with selected_tabs[0]:
                 self.render_dashboard()
+
+            # 2. Quadro Kanban (Novo recurso estilo Planner)
             with selected_tabs[1]:
-                self.render_demandas()
+                self.render_planner_tab()
+
+            # 3. Demandas (Lista)
             with selected_tabs[2]:
-                self.render_requisicoes()
+                self.render_demandas()
+
+            # 4. Requisições
             with selected_tabs[3]:
-                self.render_pedidos()
+                self.render_requisicoes()
+
+            # 5. Pedidos
             with selected_tabs[4]:
+                self.render_pedidos()
+
+            # 6. Controle de Cadastros
+            with selected_tabs[5]:
                 self.render_controle_cadastro()
+
+            # 7. Logs (Apenas Admin)
             if st.session_state.role == 'admin':
-                with selected_tabs[5]: self.render_logs_tab()
-        if st.session_state.view_history_id: self.render_history_modal()
-        if st.session_state.generate_pedido_from_rc: self.render_generate_pedido_modal()
-        if st.session_state.get('show_notifications', False): self.render_notifications_modal()
-        if st.session_state.get('concluir_cadastro_id'): self.render_concluir_cadastro_modal()
+                with selected_tabs[6]:  # Índice 6 pois inserimos o Quadro antes
+                    self.render_logs_tab()
+
+        # --- MODAIS FLUTUANTES (DIALOGS) ---
+        # Renderizados fora da estrutura principal para aparecerem por cima
+        if st.session_state.view_history_id:
+            self.render_history_modal()
+
+        if st.session_state.generate_pedido_from_rc:
+            self.render_generate_pedido_modal()
+
+        if st.session_state.get('show_notifications', False):
+            self.render_notifications_modal()
+
+        if st.session_state.get('concluir_cadastro_id'):
+            self.render_concluir_cadastro_modal()
 
     def render_sidebar(self):
         with st.sidebar:
@@ -1451,80 +2115,26 @@ class ViewManager:
             st.rerun()
 
     def _format_comment_text(self, text: str, all_users_df: pd.DataFrame) -> str:
+        """Formata o texto para corrigir quebras de linha e menções."""
         if not isinstance(text, str): return ""
-        safe_text = text.replace('\\', '\\\\').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`').replace('[', '\\[\
-').replace(']', '\\]')
-        user_mentions = re.findall(r'@(\w+)', safe_text)
-        if not user_mentions: return safe_text
-        valid_usernames = all_users_df['username'].tolist() if not all_users_df.empty else []
-        for username in user_mentions:
-            if username in valid_usernames: safe_text = safe_text.replace(f"@{username}", f"**@{username}**")
-        return safe_text
 
-    def render_data_row(self, row: pd.Series, collection: str, **kwargs):
-        key, role = f"{collection}_{row['id']}", st.session_state.role
-        with st.container(border=True):
-            if collection == 'demandas':
-                assigned_str = f" | **Atribuído a:** `{row.get('assigned_to')}`" if row.get('assigned_to') else ""
-                title = f"Demanda: {row.get('descricao_necessidade', '')} (Tipo: {row.get('tipo', 'N/A')} | Cat: {row.get('categoria', 'N/A')})"
-                st.markdown(
-                    f"**{title}**\n\n**Status:** `{row.get('status_demanda', 'N/A')}` | **Criado por:** `{row.get('solicitante_demanda', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`{assigned_str}")
-            elif collection == 'requisicoes':
-                title = f"RC: {row.get('numero_rc', 'S/N')} | Valor: {format_brazilian_currency(row.get('valor', 0))}"
-                st.markdown(
-                    f"**{title}**\n\n**Status:** `{row.get('status', 'N/A')}` | **Criado por:** `{row.get('solicitante', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
-            else:
-                title = f"Pedido: {row.get('numero_pedido', 'S/N')} | Valor: {format_brazilian_currency(row.get('valor', 0))}"
-                st.markdown(
-                    f"**{title}**\n\n**Status:** `{row.get('status', 'N/A')}` | **Criado por:** `{row.get('solicitante', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
-            if collection in ['requisicoes', 'pedidos']:
-                demanda_id = row.get('demanda_id') if collection == 'requisicoes' else (
-                    rc_info.iloc[0].get('demanda_id') if not (rc_info := kwargs.get('all_rcs', pd.DataFrame())[
-                        lambda x: x['id'] == row.get('requisicao_id')]).empty else None)
-                if demanda_id:
-                    demandas = kwargs.get('all_demandas', pd.DataFrame())
-                    if not demandas.empty and not (demanda_info := demandas[demandas['id'] == demanda_id]).empty:
-                        with st.expander("Ver Descrição da Demanda Original"): st.info(
-                            demanda_info.iloc[0]['descricao_necessidade'])
-            cols = st.columns([1, 1, 1, 2, 5])
-            is_author = (row.get('solicitante_demanda') or row.get('solicitante')) == st.session_state.username
-            if is_author or self._has_permission("pode_excluir"):
-                cols[0].button("✏️", key=f"edit_{key}", help="Editar", on_click=self._set_edit_state,
-                               args=(collection, row.to_dict()))
-            if self._has_permission("pode_excluir"):
-                cols[1].button("🗑️", key=f"del_{key}", help="Excluir", on_click=self._set_delete_state,
-                               args=(collection, row['id'], title))
-            cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico", on_click=self._set_history_state,
-                           args=(collection, row.to_dict()))
-            if collection == 'demandas':
-                all_rcs, all_pedidos = kwargs.get('all_rcs'), kwargs.get('all_pedidos')
-                linked_rc = all_rcs[
-                    all_rcs['demanda_id'] == row['id']] if all_rcs is not None and not all_rcs.empty else pd.DataFrame()
-                if not linked_rc.empty:
-                    rc_id = linked_rc.iloc[0]['id']
-                    linked_pedido = all_pedidos[all_pedidos[
-                                                    'requisicao_id'] == rc_id] if all_pedidos is not None and not all_pedidos.empty else pd.DataFrame()
-                    if not linked_pedido.empty:
-                        cols[3].button("🚚 Ver Pedido", key=f"goto_ped_{key}", on_click=self._set_focus_state,
-                                       args=('pedidos', linked_pedido.iloc[0]['id']))
-                    else:
-                        cols[3].button("🛒 Ver RC", key=f"goto_rc_{key}", on_click=self._set_focus_state,
-                                       args=('requisicoes', rc_id))
-            if collection == "requisicoes" and row.get('status') == "Aberto" and role in ['admin', 'user']:
-                cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary",
-                               on_click=self._set_generate_pedido_state, args=(row.to_dict(),))
-            if st.session_state.confirm_delete.get('id') == row['id']:
-                st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
-                c1, c2, _ = st.columns([1, 1, 8])
-                if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
-                    self.db.delete_doc(collection, row['id']);
-                    self.db.log_action(f"{collection[:-1].capitalize()} Deleted", st.session_state.username,
-                                       {"doc_id": row['id'], "description": title})
-                    st.session_state.confirm_delete = {};
-                    st.rerun()
-                if c2.button("Cancelar", key=f"canc_del_{key}"): st.session_state.confirm_delete = {}; st.rerun()
-            with st.expander("💬 Comentários"):
-                self._render_comments_section(row, collection, **kwargs)
+        # 1. Força quebra de linha visual (Markdown precisa de dois espaços ou quebra dupla)
+        # Transforma qualquer 'Enter' em 'Dois Enters' para garantir parágrafo
+        clean_text = text.replace('\r\n', '\n').replace('\n', '\n\n')
+
+        # 2. Escapa caracteres especiais que podem quebrar o visual (exceto negrito/italico basico)
+        # Se quiser permitir formatação básica, remova esta parte ou ajuste
+        # clean_text = clean_text.replace('*', '\\*').replace('_', '\\_')
+
+        # 3. Formata Menções (@usuario fica em negrito)
+        user_mentions = re.findall(r'@(\w+)', clean_text)
+        if user_mentions:
+            valid_usernames = all_users_df['username'].tolist() if not all_users_df.empty else []
+            for username in set(user_mentions):
+                if username in valid_usernames:
+                    clean_text = clean_text.replace(f"@{username}", f"**@{username}**")
+
+        return clean_text
 
     def _create_mention_notification(self, mentioned_user: str, author: str, collection: str, doc_id: str):
         item_type = {"demandas": "Demanda", "requisicoes": "Requisição", "pedidos": "Pedido"}.get(collection,
@@ -1560,61 +2170,132 @@ class ViewManager:
         self.db.log_action("Assignment Notification Sent", author, {"to_user": assigned_user, "doc_id": doc_id})
 
     def _render_comments_section(self, row, collection, **kwargs):
-        using_subcollection = row.get('using_comment_subcollection', False)
-        if using_subcollection:
-            comentarios = self.db.get_comments_from_subcollection(collection, row['id'], limit=MAX_COMMENTS_DISPLAY)
-            if comentarios: st.info(f"Exibindo os {len(comentarios)} comentários mais recentes.")
+        """
+        Renderiza comentários com botões de ação VISÍVEIS e texto formatado.
+        """
+        doc_id = row['id']
+        using_sub = row.get('using_comment_subcollection', False)
+
+        # 1. CARREGA
+        if using_sub:
+            comentarios = self.db.get_comments_from_subcollection(collection, doc_id, limit=MAX_COMMENTS_DISPLAY)
         else:
             comentarios = row.get('comentarios', [])
             if not isinstance(comentarios, list): comentarios = []
+
             if len(comentarios) >= MAX_COMMENTS_IN_DOCUMENT:
-                with st.spinner("Organizando comentários para melhor performance..."):
-                    if self.db.migrate_comments_to_subcollection(collection, row['id']): st.rerun()
-        for c in comentarios:
-            if not isinstance(c.get('timestamp'), datetime):
-                try:
-                    c['timestamp'] = pd.to_datetime(c['timestamp']).to_pydatetime()
-                except:
-                    c['timestamp'] = datetime.now()
+                with st.spinner("Otimizando..."):
+                    if self.db.migrate_comments_to_subcollection(collection, doc_id): st.rerun()
+
+        # 2. LISTA
         if not comentarios:
-            st.write("Nenhum comentário ainda.")
+            st.caption("Nenhum comentário.")
         else:
-            all_users = kwargs.get('all_users', pd.DataFrame())
-            for comment in sorted(comentarios, key=lambda c: c.get('timestamp', datetime.min), reverse=True):
-                col1, _ = st.columns([0.9, 0.1])
-                with col1:
-                    with st.chat_message(name=comment['username']):
-                        ts = comment.get('timestamp', datetime.now())
-                        st.write(f"**{comment['username']}** em {ts.strftime('%d/%m/%Y %H:%M')}")
-                        formatted_text = self._format_comment_text(comment['text'], all_users)
-                        st.markdown(formatted_text)
-                        if 'edited_at' in comment: st.caption(
-                            f"(editado em {pd.to_datetime(comment['edited_at']).strftime('%d/%m/%Y %H:%M')})")
-        new_comment_text = st.text_area("Adicionar um comentário", key=f"comment_{row['id']}")
-        if st.button("Enviar Comentário", key=f"btn_comment_{row['id']}"):
-            if new_comment_text:
-                comment_data = {"id": str(uuid.uuid4()), "username": st.session_state.username,
-                                "timestamp": datetime.now(), "text": new_comment_text}
-                current_comments = row.get('comentarios', [])
-                if using_subcollection or len(current_comments) + 1 >= MAX_COMMENTS_IN_DOCUMENT:
-                    if not using_subcollection: self.db.migrate_comments_to_subcollection(collection, row['id'])
-                    if self.db.add_comment_to_subcollection(collection, row['id'], comment_data):
-                        self.db.log_action(f"Comment Added", st.session_state.username, {"doc_id": row['id']});
-                        st.rerun()
+            # Ordena: Antigo -> Novo
+            sorted_comments = sorted(comentarios,
+                                     key=lambda x: x.get('timestamp', datetime.min) if isinstance(x.get('timestamp'),
+                                                                                                  datetime) else datetime.min)
+
+            for c in sorted_comments:
+                c_id = c.get('id')
+                is_me = c.get('username') == st.session_state.username
+                can_edit = is_me or st.session_state.role == 'admin'
+                avatar = "👤" if not is_me else "😎"
+
+                # Data
+                ts = c.get('timestamp')
+                if isinstance(ts, str): ts = datetime.fromisoformat(ts)
+                time_str = ts.strftime('%d/%m %H:%M') if ts else ""
+
+                with st.chat_message(c.get('username'), avatar=avatar):
+
+                    # --- MODO EDIÇÃO ---
+                    if st.session_state.get('editing_comment') == c_id:
+                        st.write(f"**Editando comentário de {time_str}:**")
+                        edit_txt = st.text_area("Texto", value=c.get('text'), key=f"t_{c_id}_{doc_id}",
+                                                label_visibility="collapsed")
+                        b1, b2 = st.columns([1, 1])
+
+                        if b1.button("💾 Salvar", key=f"sv_{c_id}_{doc_id}", type="primary", use_container_width=True):
+                            if using_sub:
+                                self.db.db.collection(collection).document(doc_id).collection('comments').document(
+                                    c_id).update({"text": edit_txt, "edited_at": datetime.now()})
+                            else:
+                                for item in comentarios:
+                                    if item.get('id') == c_id:
+                                        item['text'] = edit_txt;
+                                        item['edited_at'] = datetime.now();
+                                        break
+                                self.db.update_doc(collection, doc_id, {"comentarios": comentarios},
+                                                   st.session_state.username)
+                            del st.session_state.editing_comment
+                            st.rerun()
+
+                        if b2.button("❌ Cancelar", key=f"cn_{c_id}_{doc_id}", use_container_width=True):
+                            del st.session_state.editing_comment
+                            st.rerun()
+
+                    # --- MODO VISUALIZAÇÃO ---
+                    else:
+                        # 1. Cabeçalho + Botões na mesma linha (Layout 80% / 20%)
+                        # Usamos pesos inteiros grandes para evitar erro de float
+                        cols = st.columns([8, 2])
+
+                        with cols[0]:
+                            st.markdown(
+                                f"**{c.get('username')}** <span style='font-size:0.75em; color:gray'> • {time_str}</span>",
+                                unsafe_allow_html=True)
+
+                        # Botões aparecem aqui se tiver permissão
+                        if can_edit:
+                            with cols[1]:
+                                # Container horizontal para agrupar os botões
+                                sub_c1, sub_c2 = st.columns(2)
+                                sub_c1.button("✏️", key=f"ed_{c_id}_{doc_id}", help="Editar",
+                                              on_click=lambda id=c_id: st.session_state.update({'editing_comment': id}))
+                                if sub_c2.button("🗑️", key=f"dl_{c_id}_{doc_id}", help="Excluir"):
+                                    if using_sub:
+                                        self.db.db.collection(collection).document(doc_id).collection(
+                                            'comments').document(c_id).delete()
+                                    else:
+                                        new_list = [x for x in comentarios if x.get('id') != c_id]
+                                        self.db.update_doc(collection, doc_id, {"comentarios": new_list},
+                                                           st.session_state.username)
+                                    st.rerun()
+
+                        # 2. Texto do Comentário (Abaixo do cabeçalho)
+                        safe_txt = self._format_comment_text(c.get('text', ''), kwargs.get('all_users', pd.DataFrame()))
+                        st.markdown(safe_txt)
+
+                        if 'edited_at' in c: st.caption(f"_(editado)_")
+
+        # 3. NOVO COMENTÁRIO
+        st.write("")  # Espaçamento
+        new_comment = st.text_area("Novo Comentário", key=f"new_{doc_id}", height=68, label_visibility="collapsed",
+                                   placeholder="Escreva aqui...")
+
+        if st.button("Enviar Comentário", key=f"send_{doc_id}"):
+            if new_comment:
+                c_data = {"id": str(uuid.uuid4()), "username": st.session_state.username, "timestamp": datetime.now(),
+                          "text": new_comment}
+
+                # Menções
+                all_users_df = kwargs.get('all_users', pd.DataFrame())
+                valid_u = all_users_df['username'].tolist() if not all_users_df.empty else []
+                for u in set(re.findall(r'@(\w+)', new_comment)):
+                    if u in valid_u and u != st.session_state.username:
+                        self._create_mention_notification(u, st.session_state.username, collection, doc_id)
+
+                # Salvar
+                if using_sub or len(comentarios) >= 20:
+                    if not using_sub:
+                        self.db.migrate_comments_to_subcollection(collection, doc_id)
+                        using_sub = True
+                    self.db.add_comment_to_subcollection(collection, doc_id, c_data)
                 else:
-                    all_users_df = kwargs.get('all_users', pd.DataFrame())
-                    for mentioned_user in set(re.findall(r'@(\w+)', new_comment_text)):
-                        if mentioned_user in (all_users_df[
-                            'username'].tolist() if not all_users_df.empty else []) and mentioned_user != st.session_state.username:
-                            self._create_mention_notification(mentioned_user=mentioned_user,
-                                                              author=st.session_state.username, collection=collection,
-                                                              doc_id=row['id'])
-                    if self.db.update_doc(collection, row['id'], {"comentarios": current_comments + [comment_data]},
-                                          st.session_state.username):
-                        self.db.log_action(f"Comment Added", st.session_state.username, {"doc_id": row['id']});
-                        st.rerun()
-            else:
-                st.warning("O comentário não pode estar vazio.")
+                    self.db.update_doc(collection, doc_id, {"comentarios": comentarios + [c_data]},
+                                       st.session_state.username)
+                st.rerun()
 
     @st.dialog("Histórico de Alterações")
     def render_history_modal(self):
@@ -1716,6 +2397,168 @@ class ViewManager:
             logger.error(f"Falha ao gerar dados de backup: {e}", exc_info=True)
             st.error(f"Erro ao gerar backup: {e}")
             return b""
+
+    def render_planner_tab(self):
+        st.header("📋 Quadro de Tarefas")
+
+        # 1. Carrega dados
+        df_demandas = get_cached_docs(self.db, "demandas")
+        if df_demandas.empty:
+            st.info("Nenhuma demanda para exibir.")
+            return
+
+        # ---------------------------------------------------------
+        # A. BARRA DE FERRAMENTAS (FILTROS)
+        # ---------------------------------------------------------
+        with st.expander("🔎 Filtros e Visualização", expanded=True):
+            c1, c2, c3 = st.columns(3)
+
+            # 1. Lista de Usuários (Tratamento seguro)
+            # Garante que não hajam valores nulos ou erros de tipo na lista
+            unique_users = sorted(df_demandas['assigned_to'].dropna().astype(str).unique().tolist())
+            users = ["Todos"] + unique_users
+
+            # 2. Lógica Anti-Loop: Define o padrão apenas na primeira vez
+            key_filter_user = "planner_filter_user_key"
+
+            if key_filter_user not in st.session_state:
+                # Se for a primeira vez, tenta selecionar o usuário logado
+                if st.session_state.username in users:
+                    st.session_state[key_filter_user] = st.session_state.username
+                else:
+                    st.session_state[key_filter_user] = "Todos"
+
+            # 3. Selectboxes (Criação das variáveis f_user, f_cat, f_prio)
+            f_user = c1.selectbox("👤 Responsável", users, key=key_filter_user)
+
+            cats = ["Todas"] + sorted(df_demandas['categoria'].dropna().unique().tolist())
+            f_cat = c2.selectbox("🏷️ Categoria", cats, key="planner_filter_cat")
+
+            priorities = ["Todas", "Alta", "Média", "Baixa"]
+            f_prio = c3.selectbox("🚨 Prioridade", priorities, key="planner_filter_prio")
+
+        st.divider()
+
+        # ---------------------------------------------------------
+        # B. APLICAÇÃO DOS FILTROS (Agora as variáveis já existem)
+        # ---------------------------------------------------------
+        df_view = df_demandas.copy()
+
+        # Garante coluna prioridade
+        if 'prioridade' not in df_view.columns: df_view['prioridade'] = 'Média'
+
+        # Aplica filtro de usuário
+        if f_user != "Todos":
+            df_view = df_view[df_view['assigned_to'].astype(str) == f_user]
+
+        # Aplica filtro de categoria
+        if f_cat != "Todas":
+            df_view = df_view[df_view['categoria'] == f_cat]
+
+        # Aplica filtro de prioridade
+        if f_prio != "Todas":
+            df_view = df_view[df_view['prioridade'] == f_prio]
+
+        # ---------------------------------------------------------
+        # C. DEFINIÇÃO VISUAL
+        # ---------------------------------------------------------
+        cat_colors = {
+            "Facilities/Eletromecânica": "#E1BEE7",
+            "Manutenção de rede": "#BBDEFB",
+            "Tratamento": "#C8E6C9",
+            "Tratamento (Laboratório)": "#FFECB3"
+        }
+
+        kanban_columns = {
+            "A Fazer": ["Aberta", "Pendente"],
+            "Em Andamento": ["Em Atendimento", "Em Processamento", "Aguardando Aprovação"],
+            "Concluído": ["Finalizado", "Entregue", "Concluída", "Fechada"]
+        }
+
+        # CSS para etiquetas
+        st.markdown("""
+        <style>
+        .planner-tag {
+            padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: bold; color: #444; display: inline-block; margin-bottom: 5px;
+        }
+        .planner-date {
+            font-size: 0.8rem; color: #666; display: flex; align-items: center; gap: 4px;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        cols = st.columns(len(kanban_columns))
+
+        # ---------------------------------------------------------
+        # D. RENDERIZAÇÃO DAS COLUNAS
+        # ---------------------------------------------------------
+        for i, (col_name, status_list) in enumerate(kanban_columns.items()):
+            with cols[i]:
+                tasks = df_view[df_view['status_demanda'].isin(status_list)]
+                st.markdown(f"#### {col_name} <span style='font-size:0.8em; color:gray'>({len(tasks)})</span>",
+                            unsafe_allow_html=True)
+
+                for _, row in tasks.iterrows():
+                    bg_color = cat_colors.get(row.get('categoria'), "#F0F0F0")
+                    prio = row.get('prioridade', 'Média')
+                    prio_icon = "🔴" if prio == "Alta" else ("🟡" if prio == "Média" else "🟢")
+
+                    with st.container(border=True):
+                        # 1. Etiquetas
+                        st.markdown(f"""
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span class="planner-tag" style="background-color:{bg_color}">{row.get('categoria', 'Geral')}</span>
+                            <span title="Prioridade {prio}">{prio_icon}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        # 2. Descrição
+                        desc = row.get('descricao_necessidade', '')
+                        short_desc = (desc[:75] + '...') if len(desc) > 75 else desc
+                        st.markdown(f"**{short_desc}**")
+
+                        # 3. Rodapé (Data e Usuário) - COM PROTEÇÃO DE ERRO
+                        data_fmt = row['created_at'].strftime('%d/%b') if pd.notnull(row.get('created_at')) else ""
+
+                        # Lógica segura para pegar o nome
+                        raw_assigned = row.get('assigned_to')
+                        if isinstance(raw_assigned, str) and raw_assigned.strip():
+                            atribuido = raw_assigned.split(' ')[0]
+                        else:
+                            atribuido = "Ninguém"
+
+                        st.markdown(f"""
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; margin-bottom:8px;">
+                            <div class="planner-date">📅 {data_fmt}</div>
+                            <div class="planner-date">👤 {atribuido}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        # 4. Ações
+                        c_move, c_edit = st.columns([2, 1])
+
+                        current_status = row.get('status_demanda', 'Aberta')
+                        all_statuses = ["Aberta", "Em Atendimento", "Concluída", "Cancelado"]
+
+                        target_status = c_move.selectbox(
+                            "Mover",
+                            all_statuses,
+                            index=all_statuses.index(current_status) if current_status in all_statuses else 0,
+                            key=f"move_{row['id']}",
+                            label_visibility="collapsed"
+                        )
+
+                        if target_status != current_status:
+                            self.db.update_doc("demandas", row['id'],
+                                               {"status_demanda": target_status},
+                                               st.session_state.username)
+                            st.toast(f"Movido para {target_status}")
+                            time.sleep(0.5)
+                            st.rerun()
+
+                        if c_edit.button("✏️", key=f"edit_btn_{row['id']}", help="Editar detalhes"):
+                            self._set_edit_state("demandas", row.to_dict())
+                            st.rerun()
 
     def render_logs_tab(self):
         st.header("🛡️ Registros de Atividades do Sistema")
