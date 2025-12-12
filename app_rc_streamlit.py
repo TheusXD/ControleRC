@@ -526,55 +526,88 @@ def format_brazilian_currency(value: float) -> str:
 def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
     output = io.BytesIO()
     df_copy = df.copy()
+
     for col in df_copy.columns:
+        # 1. Se a coluna JÁ FOR DATA reconhecida pelo Pandas
         if pd.api.types.is_datetime64_any_dtype(df_copy[col]):
             try:
-                if hasattr(df_copy[col].dtype, 'tz') and df_copy[col].dtype.tz is not None:
+                # Remove o fuso horário (UTC -> Naive) para o Excel aceitar
+                if getattr(df_copy[col].dt, 'tz', None) is not None:
                     df_copy[col] = df_copy[col].dt.tz_localize(None)
-                elif df_copy[col].dtype == 'object':
-                    df_copy[col] = pd.to_datetime(df_copy[col], errors='coerce')
-                    if hasattr(df_copy[col].dtype, 'tz') and df_copy[col].dtype.tz is not None:
-                        df_copy[col] = df_copy[col].dt.tz_localize(None)
-            except Exception as e:
-                logger.warning(f"Não foi possível processar timezone da coluna {col}: {e}");
-                pass
+            except:
+                # Se der erro, vira texto
+                df_copy[col] = df_copy[col].astype(str)
+
+        # 2. Se for TIPO OBJETO (Listas, Dicts, Texto Misturado)
+        # Em vez de tentar converter para data (que gera o erro), forçamos TEXTO.
+        # Isso garante que a exportação funcione sem travar.
+        elif df_copy[col].dtype == 'object':
+            df_copy[col] = df_copy[col].astype(str).replace('nan', '')
+            df_copy[col] = df_copy[col].replace('NaT', '')
+            df_copy[col] = df_copy[col].replace('<NA>', '')
+
+    # GERAÇÃO DO ARQUIVO
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_copy.to_excel(writer, index=False, sheet_name=title)
         workbook, worksheet = writer.book, writer.sheets[title]
+
+        # Estilização Padrão
         header_fill = PatternFill(start_color="4F81BD", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
         border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'),
                         bottom=Side(style='thin'))
         alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
         for col_num, col_name in enumerate(df_copy.columns, 1):
             cell = worksheet.cell(row=1, column=col_num)
             cell.fill, cell.font, cell.border, cell.alignment = header_fill, header_font, border, alignment
-            max_len = max(df_copy[col_name].astype(str).map(len).max(), len(col_name)) + 2
-            worksheet.column_dimensions[get_column_letter(col_num)].width = min(max_len, 50)
+
+            # Ajuste de largura (seguro)
+            try:
+                max_len = max(df_copy[col_name].astype(str).map(len).max(), len(str(col_name))) + 2
+                worksheet.column_dimensions[get_column_letter(col_num)].width = min(max_len, 50)
+            except:
+                pass
+
+        # Formatação de Células
         for row in range(2, len(df_copy) + 2):
             for col in range(1, len(df_copy.columns) + 1):
                 cell = worksheet.cell(row=row, column=col)
                 cell.border, cell.alignment = border, Alignment(horizontal='left', vertical='center')
-                if 'valor' in df_copy.columns[col - 1].lower(): cell.number_format = 'R$ #,##0.00'
+
+                # Moeda
+                if 'valor' in df_copy.columns[col - 1].lower():
+                    cell.number_format = 'R$ #,##0.00'
+
+                # Data (Apenas se o Pandas manteve como data)
+                if isinstance(cell.value, (datetime, pd.Timestamp)):
+                    cell.number_format = 'dd/mm/yyyy hh:mm'
+
+        # Cores de Status
         status_col_name = next((col for col in ['status', 'status_demanda'] if col in df_copy.columns), None)
         if status_col_name:
-            fills = {'green': PatternFill(start_color="C6EFCE", fill_type="solid"),
-                     'red': PatternFill(start_color="FFC7CE", fill_type="solid"),
-                     'yellow': PatternFill(start_color="FFEB9C", fill_type="solid"),
-                     'blue': PatternFill(start_color="DDEBF7", fill_type="solid")}
+            fills = {
+                'green': PatternFill(start_color="C6EFCE", fill_type="solid"),
+                'red': PatternFill(start_color="FFC7CE", fill_type="solid"),
+                'yellow': PatternFill(start_color="FFEB9C", fill_type="solid"),
+                'blue': PatternFill(start_color="DDEBF7", fill_type="solid")
+            }
             status_col_index = df_copy.columns.get_loc(status_col_name) + 1
             for row in range(2, len(df_copy) + 2):
                 cell = worksheet.cell(row=row, column=status_col_index)
-                if cell.value in ['Finalizado', 'Entregue', 'Fechada']:
+                val = str(cell.value)
+                if val in ['Finalizado', 'Entregue', 'Fechada', 'Concluída']:
                     cell.fill = fills['green']
-                elif cell.value in ['Cancelado', 'Rejeitado']:
+                elif val in ['Cancelado', 'Rejeitado']:
                     cell.fill = fills['red']
-                elif cell.value in ['Em Processamento', 'Em Atendimento', 'Em Transporte', 'Pedido Gerado']:
+                elif val in ['Em Processamento', 'Em Atendimento', 'Em Transporte', 'Pedido Gerado']:
                     cell.fill = fills['yellow']
-                elif cell.value in ['Aberto', 'Aberta']:
+                elif val in ['Aberto', 'Aberta']:
                     cell.fill = fills['blue']
-        worksheet.freeze_panes = 'A2';
+
+        worksheet.freeze_panes = 'A2'
         worksheet.auto_filter.ref = worksheet.dimensions
+
     return output.getvalue()
 
 
@@ -601,25 +634,38 @@ class ViewManager:
         return st.session_state[key]
 
     def local_add(self, collection: str, new_data: dict):
-        """Adiciona um item à lista na memória sem gastar leitura."""
+        """Adiciona um item à lista na memória sem gastar leitura (CORRIGIDO)."""
         key = f"data_{collection}"
         df = self.get_data(collection)
 
-        # Garante que as colunas de data estejam no formato certo
+        # 1. Garante que o novo dado seja Timestamp do Pandas
         if 'created_at' in new_data:
-            if isinstance(new_data['created_at'], datetime):
-                new_data['created_at'] = pd.Timestamp(new_data['created_at'])
+            new_data['created_at'] = pd.to_datetime(new_data['created_at'])
 
+        # 2. Cria linha e junta com o DataFrame atual
         new_row = pd.DataFrame([new_data])
 
         if df.empty:
-            st.session_state[key] = new_row
+            combined_df = new_row
         else:
-            st.session_state[key] = pd.concat([df, new_row], ignore_index=True)
+            combined_df = pd.concat([df, new_row], ignore_index=True)
 
-        # Reordena (mais novo primeiro)
-        if 'created_at' in st.session_state[key].columns:
-            st.session_state[key] = st.session_state[key].sort_values(by='created_at', ascending=False)
+        # 3. CORREÇÃO DO ERRO DE FUSO HORÁRIO
+        # Converte toda a coluna para UTC e remove a informação de fuso (deixa tudo igual)
+        if 'created_at' in combined_df.columns:
+            try:
+                # Força conversão para datetime, converte para UTC e remove o TZ (vira naive)
+                combined_df['created_at'] = pd.to_datetime(combined_df['created_at'], utc=True).dt.tz_localize(None)
+
+                # Agora ordena sem erro
+                combined_df = combined_df.sort_values(by='created_at', ascending=False)
+            except Exception as e:
+                # Se der erro na conversão de data, apenas segue sem ordenar ou ignora
+                print(f"Aviso de data: {e}")
+                pass
+
+        # Salva no estado
+        st.session_state[key] = combined_df
 
     def local_update(self, collection: str, doc_id: str, updated_fields: dict):
         """Atualiza um item na memória sem gastar leitura."""
@@ -1149,7 +1195,7 @@ class ViewManager:
                     st.rerun()
 
     def render_data_row(self, row: pd.Series, collection: str, **kwargs):
-        """Renderiza uma linha de dados (Card) nas listas de Demandas, RCs e Pedidos."""
+        """Renderiza uma linha de dados (Card) nas listas com Modo Econômico ativo."""
         key, role = f"{collection}_{row['id']}", st.session_state.role
 
         with st.container(border=True):
@@ -1170,12 +1216,10 @@ class ViewManager:
                 st.markdown(
                     f"**{title}**\n\n**Status:** `{row.get('status', 'N/A')}` | **Criado por:** `{row.get('solicitante', 'N/A')}` em `{row.get('created_at').strftime('%d/%m/%Y')}`")
 
-            # 2. Informações de Vínculo (Ex: Mostrar qual demanda gerou a RC)
+            # 2. Informações de Vínculo
             if collection in ['requisicoes', 'pedidos']:
-                # Tenta achar o ID da demanda original
                 demanda_id = row.get('demanda_id')
                 if collection == 'pedidos':
-                    # Se for pedido, precisa achar a RC primeiro para pegar o demanda_id dela
                     all_rcs = kwargs.get('all_rcs', pd.DataFrame())
                     if not all_rcs.empty:
                         rc_info = all_rcs[all_rcs['id'] == row.get('requisicao_id')]
@@ -1208,19 +1252,17 @@ class ViewManager:
             cols[2].button("📜", key=f"hist_{key}", help="Ver Histórico", on_click=self._set_history_state,
                            args=(collection, row.to_dict()))
 
-            # Botões de Fluxo (Ir para Pedido / Gerar Pedido)
+            # Botões de Fluxo
             if collection == 'demandas':
                 all_rcs = kwargs.get('all_rcs')
                 all_pedidos = kwargs.get('all_pedidos')
 
-                # Verifica se tem RC ligada
                 linked_rc = pd.DataFrame()
                 if all_rcs is not None and not all_rcs.empty:
                     linked_rc = all_rcs[all_rcs['demanda_id'] == row['id']]
 
                 if not linked_rc.empty:
                     rc_id = linked_rc.iloc[0]['id']
-                    # Verifica se tem Pedido ligado à RC
                     linked_pedido = pd.DataFrame()
                     if all_pedidos is not None and not all_pedidos.empty:
                         linked_pedido = all_pedidos[all_pedidos['requisicao_id'] == rc_id]
@@ -1236,157 +1278,245 @@ class ViewManager:
                 cols[3].button("📦 Gerar Pedido", key=f"gen_ped_{key}", type="primary",
                                on_click=self._set_generate_pedido_state, args=(row.to_dict(),))
 
-            # Lógica de Confirmação de Exclusão (Aparece se clicou na lixeira)
+            # --- LÓGICA DE EXCLUSÃO (Com Modo Econômico e Fix do Log) ---
             if st.session_state.confirm_delete.get('id') == row['id']:
                 st.warning(f"Excluir '{st.session_state.confirm_delete['desc']}'?")
                 c1, c2, _ = st.columns([1, 1, 8])
+
                 if c1.button("Sim, excluir", key=f"conf_del_{key}", type="primary"):
+                    # 1. Deleta do Banco (Gasta escrita)
                     self.db.delete_doc(collection, row['id'])
 
-                    # --- MODO ECONÔMICO ---
+                    # 2. Deleta da Memória Local (Economiza leitura)
                     self.local_delete(collection, row['id'])
-                    # ----------------------
-                    self.db.log_action(...)
+
+                    # 3. Log de Auditoria (Corrigido para incluir username)
+                    self.db.log_action(
+                        f"{collection[:-1].capitalize()} Deleted",
+                        st.session_state.username,
+                        {"doc_id": row['id'], "description": title}
+                    )
+
                     st.session_state.confirm_delete = {}
                     st.rerun()
+
                 if c2.button("Cancelar", key=f"canc_del_{key}"):
                     st.session_state.confirm_delete = {}
                     st.rerun()
+
             # 4. Seção de Comentários
             with st.expander("💬 Comentários"):
+                # Chama a função que já corrigimos anteriormente
                 self._render_comments_section(row, collection, **kwargs)
 
+    def to_excel(df: pd.DataFrame, title: str = "Relatório") -> bytes:
+        output = io.BytesIO()
+        df_copy = df.copy()
+
+        # LISTA DE COLUNAS CONHECIDAS DE DATA (Adicione outras se criar campos novos)
+        date_cols = ['created_at', 'updated_at', 'closed_at', 'data_entrega', 'timestamp']
+
+        for col in df_copy.columns:
+            # 1. Se for uma das colunas de data conhecidas, forçamos a limpeza
+            if col in date_cols or pd.api.types.is_datetime64_any_dtype(df_copy[col]):
+                try:
+                    # Converte para datetime (caso esteja como texto/objeto)
+                    df_copy[col] = pd.to_datetime(df_copy[col], errors='coerce')
+                    # Remove o fuso horário (UTC -> Naive)
+                    if df_copy[col].dt.tz is not None:
+                        df_copy[col] = df_copy[col].dt.tz_localize(None)
+                except Exception:
+                    # Se falhar, converte para string para garantir que o Excel aceite
+                    df_copy[col] = df_copy[col].astype(str)
+
+            # 2. Varredura em colunas do tipo "Object" (onde datas podem se esconder)
+            elif df_copy[col].dtype == 'object':
+                try:
+                    # Verifica se a primeira linha válida é um Timestamp
+                    first_valid = df_copy[col].dropna().iloc[0] if not df_copy[col].dropna().empty else None
+                    if isinstance(first_valid, (pd.Timestamp, datetime)):
+                        # É uma coluna de objetos datetime, tenta converter
+                        df_copy[col] = pd.to_datetime(df_copy[col], errors='ignore')
+                        if hasattr(df_copy[col].dt, 'tz') and df_copy[col].dt.tz is not None:
+                            df_copy[col] = df_copy[col].dt.tz_localize(None)
+                except:
+                    pass
+
+        # GERAÇÃO DO ARQUIVO
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_copy.to_excel(writer, index=False, sheet_name=title)
+            workbook, worksheet = writer.book, writer.sheets[title]
+
+            # Estilização
+            header_fill = PatternFill(start_color="4F81BD", fill_type="solid")
+            header_font = Font(color="FFFFFF", bold=True)
+            border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'),
+                            bottom=Side(style='thin'))
+            alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+            for col_num, col_name in enumerate(df_copy.columns, 1):
+                cell = worksheet.cell(row=1, column=col_num)
+                cell.fill, cell.font, cell.border, cell.alignment = header_fill, header_font, border, alignment
+
+                # Ajuste de largura
+                try:
+                    # Converte para string antes de medir o tamanho para evitar erro
+                    max_len = max(df_copy[col_name].astype(str).map(len).max(), len(str(col_name))) + 2
+                    worksheet.column_dimensions[get_column_letter(col_num)].width = min(max_len, 50)
+                except:
+                    pass
+
+            for row in range(2, len(df_copy) + 2):
+                for col in range(1, len(df_copy.columns) + 1):
+                    cell = worksheet.cell(row=row, column=col)
+                    cell.border, cell.alignment = border, Alignment(horizontal='left', vertical='center')
+
+                    # Formatação de Moeda
+                    if 'valor' in df_copy.columns[col - 1].lower():
+                        cell.number_format = 'R$ #,##0.00'
+
+                    # Formatação de Data (Se for data mesmo)
+                    if isinstance(cell.value, (datetime, pd.Timestamp)):
+                        cell.number_format = 'dd/mm/yyyy hh:mm'
+
+            # Cores de Status
+            status_col_name = next((col for col in ['status', 'status_demanda'] if col in df_copy.columns), None)
+            if status_col_name:
+                fills = {'green': PatternFill(start_color="C6EFCE", fill_type="solid"),
+                         'red': PatternFill(start_color="FFC7CE", fill_type="solid"),
+                         'yellow': PatternFill(start_color="FFEB9C", fill_type="solid"),
+                         'blue': PatternFill(start_color="DDEBF7", fill_type="solid")}
+                status_col_index = df_copy.columns.get_loc(status_col_name) + 1
+                for row in range(2, len(df_copy) + 2):
+                    cell = worksheet.cell(row=row, column=status_col_index)
+                    val = str(cell.value)
+                    if val in ['Finalizado', 'Entregue', 'Fechada', 'Concluída']:
+                        cell.fill = fills['green']
+                    elif val in ['Cancelado', 'Rejeitado']:
+                        cell.fill = fills['red']
+                    elif val in ['Em Processamento', 'Em Atendimento', 'Em Transporte', 'Pedido Gerado']:
+                        cell.fill = fills['yellow']
+                    elif val in ['Aberto', 'Aberta']:
+                        cell.fill = fills['blue']
+
+            worksheet.freeze_panes = 'A2'
+            worksheet.auto_filter.ref = worksheet.dimensions
+
+        return output.getvalue()
+
     def _render_comments_section(self, row, collection, **kwargs):
-        """
-        Renderiza a seção de comentários com layout simplificado para garantir
-        que os botões apareçam mesmo dentro de expanders.
-        """
+        """Renderiza comentários corrigindo os avisos de layout (width='stretch')."""
         doc_id = row['id']
         using_sub = row.get('using_comment_subcollection', False)
 
-        # 1. CARREGA COMENTÁRIOS
+        # 1. CARREGA
         if using_sub:
             comentarios = self.db.get_comments_from_subcollection(collection, doc_id, limit=MAX_COMMENTS_DISPLAY)
         else:
             comentarios = row.get('comentarios', [])
             if not isinstance(comentarios, list): comentarios = []
-
-            # Migração automática
             if len(comentarios) >= MAX_COMMENTS_IN_DOCUMENT:
-                with st.spinner("Otimizando comentários..."):
-                    if self.db.migrate_comments_to_subcollection(collection, doc_id):
-                        st.rerun()
+                with st.spinner("Otimizando..."):
+                    if self.db.migrate_comments_to_subcollection(collection, doc_id): st.rerun()
 
-        # 2. EXIBE A LISTA
+        # 2. LISTA
         if not comentarios:
-            st.caption("Nenhum comentário ainda.")
+            st.caption("Nenhum comentário.")
         else:
-            # Ordena: Antigo -> Novo
-            sorted_comments = sorted(comentarios, key=lambda x: x.get('timestamp', datetime.min) if isinstance(x.get('timestamp'), datetime) else datetime.min)
+            sorted_comments = sorted(comentarios,
+                                     key=lambda x: x.get('timestamp', datetime.min) if isinstance(x.get('timestamp'),
+                                                                                                  datetime) else datetime.min)
 
             for c in sorted_comments:
                 c_id = c.get('id')
-                # Verifica permissão
                 is_me = c.get('username') == st.session_state.username
                 can_edit = is_me or st.session_state.role == 'admin'
-
                 avatar = "👤" if not is_me else "😎"
 
-                # Formata data
                 ts = c.get('timestamp')
                 if isinstance(ts, str): ts = datetime.fromisoformat(ts)
                 time_str = ts.strftime('%d/%m %H:%M') if ts else ""
 
                 with st.chat_message(c.get('username'), avatar=avatar):
-
-                    # --- LAYOUT ROBUSTO (SEM COLUNAS ANINHADAS) ---
-                    # Divide a linha do cabeçalho em 3: [Texto] [Editar] [Excluir]
-                    if can_edit:
-                        # Se pode editar, reserva espaço para os botões
-                        c_head, c_edit, c_del = st.columns([0.8, 0.1, 0.1])
-                    else:
-                        # Se não pode editar, o texto ocupa tudo
-                        c_head = st.columns([1])[0]
-                        c_edit, c_del = None, None
-
-                    # Renderiza Nome e Data
-                    with c_head:
-                        st.markdown(f"**{c.get('username')}** <span style='font-size:0.75em; color:gray'>({time_str})</span>", unsafe_allow_html=True)
-
-                    # Renderiza Botões (direto na coluna principal, sem criar novas colunas dentro)
-                    if can_edit:
-                        with c_edit:
-                            if st.button("✏️", key=f"ed_{c_id}_{doc_id}", help="Editar"):
-                                st.session_state.editing_comment = c_id
-                                st.rerun()
-                        with c_del:
-                            if st.button("🗑️", key=f"dl_{c_id}_{doc_id}", help="Excluir"):
-                                if using_sub:
-                                    self.db.db.collection(collection).document(doc_id).collection('comments').document(c_id).delete()
-                                else:
-                                    new_list = [x for x in comentarios if x.get('id') != c_id]
-                                    self.db.update_doc(collection, doc_id, {"comentarios": new_list}, st.session_state.username)
-                                st.rerun()
-
-                    # --- CONTEÚDO (Visualização ou Edição) ---
+                    # --- MODO EDIÇÃO ---
                     if st.session_state.get('editing_comment') == c_id:
-                        # MODO EDIÇÃO
-                        edit_txt = st.text_area("Editar:", value=c.get('text'), key=f"txt_{c_id}_{doc_id}")
-                        col_s, col_c = st.columns([1, 1])
+                        st.write(f"**Editando:**")
+                        edit_txt = st.text_area("Texto", value=c.get('text'), key=f"t_{c_id}_{doc_id}",
+                                                label_visibility="collapsed")
+                        b1, b2 = st.columns([1, 1])
 
-                        if col_s.button("✅ Salvar", key=f"sav_{c_id}_{doc_id}"):
+                        # CORREÇÃO AQUI: width='stretch' em vez de use_container_width=True
+                        if b1.button("💾 Salvar", key=f"sv_{c_id}_{doc_id}", type="primary", width='stretch'):
                             if using_sub:
-                                self.db.db.collection(collection).document(doc_id).collection('comments').document(c_id).update({
-                                    "text": edit_txt, "edited_at": datetime.now()
-                                })
+                                self.db.db.collection(collection).document(doc_id).collection('comments').document(
+                                    c_id).update({"text": edit_txt, "edited_at": datetime.now()})
                             else:
                                 for item in comentarios:
                                     if item.get('id') == c_id:
-                                        item['text'] = edit_txt
-                                        item['edited_at'] = datetime.now()
+                                        item['text'] = edit_txt;
+                                        item['edited_at'] = datetime.now();
                                         break
-                                self.db.update_doc(collection, doc_id, {"comentarios": comentarios}, st.session_state.username)
-
+                                self.db.update_doc(collection, doc_id, {"comentarios": comentarios},
+                                                   st.session_state.username)
                             del st.session_state.editing_comment
                             st.rerun()
 
-                        if col_c.button("Cancelar", key=f"can_{c_id}_{doc_id}"):
+                        # CORREÇÃO AQUI
+                        if b2.button("❌ Cancelar", key=f"cn_{c_id}_{doc_id}", width='stretch'):
                             del st.session_state.editing_comment
                             st.rerun()
+
+                    # --- MODO VISUALIZAÇÃO ---
                     else:
-                        # MODO LEITURA (Usando sua função de formatação)
+                        cols = st.columns([8, 2])
+                        with cols[0]:
+                            st.markdown(
+                                f"**{c.get('username')}** <span style='font-size:0.75em; color:gray'> • {time_str}</span>",
+                                unsafe_allow_html=True)
+
+                        if can_edit:
+                            with cols[1]:
+                                sub_c1, sub_c2 = st.columns(2)
+                                sub_c1.button("✏️", key=f"ed_{c_id}_{doc_id}", help="Editar",
+                                              on_click=lambda id=c_id: st.session_state.update({'editing_comment': id}))
+                                if sub_c2.button("🗑️", key=f"dl_{c_id}_{doc_id}", help="Excluir"):
+                                    if using_sub:
+                                        self.db.db.collection(collection).document(doc_id).collection(
+                                            'comments').document(c_id).delete()
+                                    else:
+                                        new_list = [x for x in comentarios if x.get('id') != c_id]
+                                        self.db.update_doc(collection, doc_id, {"comentarios": new_list},
+                                                           st.session_state.username)
+                                    st.rerun()
+
                         safe_txt = self._format_comment_text(c.get('text', ''), kwargs.get('all_users', pd.DataFrame()))
                         st.markdown(safe_txt)
-                        if 'edited_at' in c:
-                            st.caption("(editado)")
+                        if 'edited_at' in c: st.caption(f"_(editado)_")
 
-        # 3. CAMPO PARA NOVO COMENTÁRIO
-        new_comment = st.text_area("Adicionar comentário", key=f"add_c_{doc_id}", height=68, label_visibility="collapsed", placeholder="Escreva um comentário...")
-        if st.button("Enviar", key=f"snd_c_{doc_id}"):
+        # 3. NOVO COMENTÁRIO
+        st.write("")
+        new_comment = st.text_area("Novo Comentário", key=f"new_{doc_id}", height=68, label_visibility="collapsed",
+                                   placeholder="Escreva aqui...")
+
+        if st.button("Enviar Comentário", key=f"send_{doc_id}"):
             if new_comment:
-                c_data = {
-                    "id": str(uuid.uuid4()),
-                    "username": st.session_state.username,
-                    "timestamp": datetime.now(),
-                    "text": new_comment
-                }
+                c_data = {"id": str(uuid.uuid4()), "username": st.session_state.username, "timestamp": datetime.now(),
+                          "text": new_comment}
 
-                # Notificações
                 all_users_df = kwargs.get('all_users', pd.DataFrame())
-                valid_users = all_users_df['username'].tolist() if not all_users_df.empty else []
+                valid_u = all_users_df['username'].tolist() if not all_users_df.empty else []
                 for u in set(re.findall(r'@(\w+)', new_comment)):
-                    if u in valid_users and u != st.session_state.username:
+                    if u in valid_u and u != st.session_state.username:
                         self._create_mention_notification(u, st.session_state.username, collection, doc_id)
 
-                # Salvar
                 if using_sub or len(comentarios) >= 20:
                     if not using_sub:
                         self.db.migrate_comments_to_subcollection(collection, doc_id)
                         using_sub = True
                     self.db.add_comment_to_subcollection(collection, doc_id, c_data)
                 else:
-                    self.db.update_doc(collection, doc_id, {"comentarios": comentarios + [c_data]}, st.session_state.username)
-
+                    self.db.update_doc(collection, doc_id, {"comentarios": comentarios + [c_data]},
+                                       st.session_state.username)
                 st.rerun()
 
     def render_main_app(self):
